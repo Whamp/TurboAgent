@@ -349,3 +349,139 @@ def test_openai_stream_replay_echoes_model(proxy):
     assert "data: [DONE]" in resp.text
     first = json.loads(resp.text.splitlines()[0][len("data: "):])
     assert first["model"] == "my-client-model"
+
+
+
+# ---------------------------------------------------------------------------
+# Client-limit/thinking survival + judge configurability (Grok review follow-up)
+# ---------------------------------------------------------------------------
+
+def _make_backend(tmp_path, text: str):
+    """Build a Backend from YAML text in a throwaway dir."""
+    from turbo_agent.proxy.backend import Backend
+
+    p = tmp_path / "turbo-agent.yaml"
+    p.write_text(text)
+    return Backend(Config(str(p)))
+
+
+def test_candidates_keep_client_limits_and_effort(tmp_path, monkeypatch):
+    """H1 regression: the per-candidate YAML overlay must not undo the
+    client's clamped max_tokens or its reasoning effort."""
+    import asyncio
+
+    import turbo_agent.proxy.backend as bmod
+
+    backend = _make_backend(tmp_path, """
+log_dir: test_logs
+
+backend:
+  models:
+    - name: openai/dummy
+      api_key: x
+      num_candidates: 3
+      max_tokens: 65536
+      thinking: high
+
+verifier:
+  model: {name: openai/dummy, api_key: x}
+  majority_voting: true
+  method: {name: pivot_tournament, pivots: 1, n_verifications: 1, seed: 0}
+""")
+    seen = []
+
+    async def fake(**kw):
+        seen.append({
+            k: kw.get(k)
+            for k in ("max_tokens", "max_completion_tokens",
+                      "reasoning_effort", "thinking_budget")
+        })
+        return {
+            "id": "x", "object": "chat.completion", "created": 1,
+            "model": "dummy",
+            "choices": [{"index": 0,
+                         "message": {"role": "assistant", "content": "ok"},
+                         "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1,
+                      "total_tokens": 2},
+        }
+
+    bmod.llm_completion = fake
+    asyncio.run(backend.complete_anthropic(json.dumps({
+        "model": "claude-x",
+        "max_tokens": 32000,
+        "thinking": {"type": "adaptive", "effort": "low"},
+        "messages": [{"role": "user", "content": "hi"}],
+    })))
+    assert len(seen) == 3
+    for req in seen:
+        assert req["max_tokens"] == 32000        # client value, not 65536
+        assert req["reasoning_effort"] == "low"  # client, not YAML "high"
+
+
+def test_no_dual_token_key_and_budget_floor(tmp_path):
+    """H4: no max_completion_tokens injected on the Anthropic path; H2: the
+    thinking budget is strictly below max_tokens or dropped."""
+    backend = _make_backend(tmp_path, """
+backend:
+  models:
+    - name: openai/dummy
+      api_key: x
+      max_tokens: 65536
+      thinking: 2048
+""")
+    params, _ = backend._build_anthropic_params(
+        {"model": "m", "max_tokens": 32000, "messages": []})
+    assert params["max_tokens"] == 32000
+    assert "max_completion_tokens" not in params  # one field on the wire
+
+    # tiny client cap: no thinking budget fits strictly below it -> dropped
+    tiny = _make_backend(tmp_path, """
+backend:
+  models:
+    - name: openai/dummy
+      api_key: x
+      max_tokens: 65536
+      thinking: 2048
+""")
+    p, _ = tiny._build_anthropic_params(
+        {"model": "m", "max_tokens": 200, "messages": []})
+    assert "thinking_budget" not in p
+
+
+def test_verifier_judge_is_configurable(tmp_path, monkeypatch):
+    """A non-Gemini verifier model builds an OpenAI-compatible judge client
+    (OpenRouter by default; local/base_url honored); deepseek builds the
+    DeepSeek API client."""
+    from turbo_agent.verifier import Verifier
+
+    def cfg(name, base_url="", key="k"):
+        p = tmp_path / f"j{name.replace('/', '_')}.yaml"
+        p.write_text(f"""
+backend:
+  models:
+    - name: openai/dummy
+      api_key: x
+
+verifier:
+  model:
+    name: {name}
+    api_key: {key}
+    base_url: {base_url}
+  method: {{name: pivot_tournament, pivots: 1, n_verifications: 1}}
+""")
+        return Config(str(p)).verifier_config
+
+    v = Verifier(cfg("openrouter/deepseek/deepseek-v4-pro-0813"))
+    assert v.model_id == "deepseek/deepseek-v4-pro-0813"
+    client = v.client
+    assert hasattr(client, "chat")                  # OpenAI-compatible
+    assert "openrouter.ai" in str(client.base_url)
+
+    v2 = Verifier(cfg("openai/local-judge",
+                      "http://100.92.238.117:30000/v1"))
+    assert v2.model_id == "local-judge"
+    assert str(v2.client.base_url) == "http://100.92.238.117:30000/v1/"
+
+    v3 = Verifier(cfg("deepseek/deepseek-v4-flash"))
+    assert getattr(v3.client, "_llm_verifier_deepseek", False)

@@ -22,6 +22,11 @@ class AnthropicToOpenAI:
             return {"type": "text", "text": block.get("text", "")}
         if t == "image":
             source = block.get("source", {})
+            if source.get("type") == "url":
+                return {
+                    "type": "image_url",
+                    "image_url": {"url": source.get("url", "")},
+                }
             return {
                 "type": "image_url",
                 "image_url": {

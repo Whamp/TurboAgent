@@ -94,6 +94,8 @@ def main() -> int:
                 existing = json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
             existing = {}
+        parent = os.path.dirname(os.path.abspath(path))
+        os.makedirs(parent, exist_ok=True)
         existing.setdefault("providers", {})[PROVIDER_NAME] = block["providers"][PROVIDER_NAME]
         with open(path, "w") as f:
             json.dump(existing, f, indent=2)

@@ -168,6 +168,12 @@ class Backend:
             }
             p = {**params_base, "model": name, "api_key": api_key, **model_params}
             p.pop("stream", None)
+            # The YAML overlay must not undo the request's clamped caps or
+            # thinking settings: re-assert the request-derived values, then
+            # re-clamp against THIS entry's cap so the wire params are the
+            # effective ones for every candidate.
+            p.update(self._client_intent(params_base))
+            self._apply_token_limits(p, cap=model_params.get("max_tokens"))
             resp = await llm_completion(**p)
             return resp, name
 
@@ -350,24 +356,51 @@ class Backend:
                 )
         return "\n".join(parts) if parts else "(empty response)"
 
-    def _apply_token_limits(self, params: dict) -> None:
-        """Clamp client-provided token caps to the configured backend cap and
-        keep the thinking budget strictly below max_tokens (Gemini-style
-        thinking needs output headroom outside the budget)."""
-        config_max = self.config.default_model.get("max_tokens")
+    # Keys derived from the client request (or the YAML default when the
+    # client was silent) that must survive the per-candidate YAML overlay.
+    _CLIENT_KEYS = (
+        "max_tokens", "max_completion_tokens", "temperature", "top_p",
+        "stop", "reasoning_effort", "thinking_budget", "tool_choice",
+    )
+
+    def _client_intent(self, params_base: dict) -> dict:
+        """The request-derived values ``_gather_completions`` re-asserts after
+        the per-candidate YAML overlay, so client caps/thinking are not
+        silently replaced by the config for candidate calls."""
+        return {
+            k: params_base[k] for k in self._CLIENT_KEYS if k in params_base
+        }
+
+    def _apply_token_limits(self, params: dict, cap: int | None = None) -> None:
+        """Clamp client-provided token caps to the backend cap and keep the
+        thinking budget strictly below max_tokens.
+
+        Only keys already present are touched: the client's field (max_tokens
+        on the Anthropic path, max_completion_tokens on the OpenAI path) stays
+        the only one on the wire, so a backend that maps either key (Gemini's
+        max_output_tokens) never sees a second, larger value win. ``cap`` is
+        the per-candidate YAML max_tokens when set, else the default model's.
+        """
+        if cap is None:
+            cap = self.config.default_model.get("max_tokens")
         for key in ("max_tokens", "max_completion_tokens"):
-            val = params.get(key)
-            if config_max and val:
-                params[key] = min(int(val), int(config_max))
-            elif config_max and not val:
-                params[key] = int(config_max)
-            elif val:
-                params[key] = int(val)
+            if key not in params:
+                continue
+            val = int(params[key])
+            params[key] = val if cap is None else min(val, int(cap))
 
         budget = params.get("thinking_budget")
         max_tokens = params.get("max_tokens")
-        if budget and max_tokens and int(budget) >= int(max_tokens):
-            params["thinking_budget"] = max(1024, int(max_tokens) - 1024)
+        if budget is not None and max_tokens is not None:
+            mt = int(max_tokens)
+            b = int(budget)
+            if b >= mt:
+                # Anthropic requires budget_tokens >= 1024 and < max_tokens;
+                # a window too small for a valid budget drops thinking.
+                if mt > 2048:
+                    params["thinking_budget"] = min(b, mt - 1024)
+                else:
+                    params.pop("thinking_budget", None)
 
     # ------------------------------------------------------------------
     # Anthropic-format API
@@ -405,8 +438,13 @@ class Backend:
 
         # Honor the client's thinking request when present; the config's
         # thinking settings remain the default for requests that omit it.
+        # Client thinking replaces the config's thinking settings wholesale:
+        # a budget request must not leave a YAML reasoning_effort in force,
+        # and vice versa.
         thinking = anthropic_body.get("thinking")
         if isinstance(thinking, dict):
+            params.pop("reasoning_effort", None)
+            params.pop("thinking_budget", None)
             if thinking.get("type") == "adaptive" or thinking.get("effort"):
                 params["reasoning_effort"] = thinking.get("effort", "high")
             budget = thinking.get("budget_tokens")
@@ -647,6 +685,9 @@ class Backend:
             params["stream"] = openai_body["stream"]
         if openai_body.get("stream_options"):
             params["stream_options"] = openai_body["stream_options"]
+        if openai_body.get("reasoning_effort"):
+            # client effort replaces any budget-based YAML thinking
+            params.pop("thinking_budget", None)
 
         self._apply_token_limits(params)
         return params, requested_model

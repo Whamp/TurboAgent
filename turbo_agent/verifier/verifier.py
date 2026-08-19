@@ -18,7 +18,12 @@ import tempfile
 from typing import List, Optional
 
 import llm_verifier
-from llm_verifier.fine_grained_reward import build_prompt, directed_reward
+from llm_verifier.fine_grained_reward import (
+    build_prompt,
+    create_deepseek_client,
+    create_openai_client,
+    directed_reward,
+)
 from llm_verifier.prompts import normalize_criteria
 
 from ..utils import VerifierConfig, create_logger
@@ -68,7 +73,7 @@ class Verifier:
     def __init__(self, cfg: VerifierConfig):
         self.cfg = cfg
         self.method = cfg.method
-        self.model_id = cfg.model.name.removeprefix("gemini/")
+        self.model_id = self._wire_model_id(cfg.model.name)
         self.criteria = normalize_criteria(
             [{"name": c.name, "description": c.description}
              for c in self.method.criteria]
@@ -80,17 +85,50 @@ class Verifier:
             f"criteria={[c['name'] for c in self.criteria]}"
         )
 
+    @staticmethod
+    def _wire_model_id(name: str) -> str:
+        """The model id actually sent to the judge API: strip the litellm
+        provider prefix and keep everything after it
+        (gemini/gemini-2.5-flash -> gemini-2.5-flash,
+        openrouter/deepseek/deepseek-v4-flash-0731 ->
+        deepseek/deepseek-v4-flash-0731, openai/dummy -> dummy)."""
+        return name.split("/", 1)[1] if "/" in name else name
+
     @property
     def client(self):
-        """A google-genai client built from the config's api_key/provider;
-        None lets llm-verifier create one from the environment."""
-        if self._client is None and self.cfg.model.api_key:
+        """The llm-verifier judge client, built from the verifier model
+        config. The model name selects the backend:
+          gemini/*      -> google-genai (Vertex AI for full logprobs)
+          deepseek/*    -> DeepSeek hosted API
+          openrouter/*  -> OpenRouter (OpenAI-compatible, logprobs where
+                           the upstream provider exposes them)
+          anything else -> any OpenAI-compatible server; ``base_url``
+                           selects a local vLLM/SGLang/OpenAI endpoint
+        ``None`` (gemini with no key) lets llm-verifier create a client
+        from the environment.
+        """
+        if self._client is not None:
+            return self._client
+
+        name = self.cfg.model.name
+        api_key = self.cfg.model.api_key
+        base_url = self.cfg.model.base_url
+
+        if name.startswith("gemini/") and api_key:
             from google import genai
             if self.cfg.model.provider == "vertex_ai":
-                self._client = genai.Client(vertexai=True,
-                                            api_key=self.cfg.model.api_key)
+                self._client = genai.Client(vertexai=True, api_key=api_key)
             else:
-                self._client = genai.Client(api_key=self.cfg.model.api_key)
+                self._client = genai.Client(api_key=api_key)
+        elif name.startswith("deepseek/"):
+            self._client = create_deepseek_client(api_key=api_key)
+        else:
+            if base_url is None and name.startswith("openrouter/"):
+                base_url = "https://openrouter.ai/api/v1"
+            elif base_url is None and name.startswith("openai/"):
+                base_url = "https://api.openai.com/v1"
+            self._client = create_openai_client(base_url=base_url,
+                                                api_key=api_key)
         return self._client
 
     # ------------------------------------------------------------------
