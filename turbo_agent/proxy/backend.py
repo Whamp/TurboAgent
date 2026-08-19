@@ -413,8 +413,8 @@ class Backend:
         params[cls._CLIENT_SUPPLIED_KEYS] = tuple(k for k in keys if k in params)
 
     def _apply_token_limits(self, params: dict, cap: int | None = None) -> None:
-        """Clamp client-provided token caps to the backend cap and keep the
-        thinking budget strictly below max_tokens.
+        """Clamp client-provided token caps to the backend cap. Drop a
+        thinking budget that cannot fit strictly below max_tokens.
 
         Only keys already present are touched: the client's field (max_tokens
         on the Anthropic path, max_completion_tokens on the OpenAI path) stays
@@ -437,13 +437,11 @@ class Backend:
         if budget is not None and output_cap is not None:
             mt = int(output_cap)
             b = int(budget)
+            # Anthropic requires budget_tokens < max_tokens. If YAML thinking
+            # (or a client budget) cannot fit under the request's output cap,
+            # drop thinking rather than shrinking the cap Pi already set.
             if b >= mt:
-                # Anthropic requires budget_tokens >= 1024 and < max_tokens;
-                # a window too small for a valid budget drops thinking.
-                if mt >= 2048:
-                    params["thinking_budget"] = min(b, mt - 1024)
-                else:
-                    params.pop("thinking_budget", None)
+                params.pop("thinking_budget", None)
 
     # ------------------------------------------------------------------
     # Anthropic-format API

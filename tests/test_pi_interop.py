@@ -875,8 +875,9 @@ verifier:
     assert v.client is None
 
 
-def test_budget_floor_at_2048(tmp_path):
-    """max_tokens == 2048 still has room for a 1024 thinking budget."""
+def test_thinking_dropped_when_budget_does_not_fit_cap(tmp_path):
+    """YAML thinking that cannot fit under the client's max_tokens is dropped,
+    not rewritten to steal output tokens."""
     backend = _make_backend(tmp_path, """
 backend:
   models:
@@ -885,10 +886,15 @@ backend:
       max_tokens: 65536
       thinking: 2048
 """)
-    params, _ = backend._build_anthropic_params({
+    tied, _ = backend._build_anthropic_params({
         "model": "m", "max_tokens": 2048, "messages": [],
     })
-    assert params.get("thinking_budget") == 1024
+    assert "thinking_budget" not in tied
+
+    fits, _ = backend._build_anthropic_params({
+        "model": "m", "max_tokens": 4096, "messages": [],
+    })
+    assert fits.get("thinking_budget") == 2048
 
 
 def test_count_tokens_counts_images(proxy):
