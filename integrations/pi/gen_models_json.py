@@ -24,6 +24,7 @@ Note: pi expects camelCase model fields (contextWindow, maxTokens).
 
 import argparse
 import json
+import os
 import sys
 
 import yaml
