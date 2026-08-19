@@ -905,7 +905,7 @@ class Backend:
             "context_window": model.get("context_window")
             or context_defaults.get(prefix, 128_000),
             "max_tokens": cfg_max or 8192,
-            "reasoning": model.get("thinking") is not None,
+            "reasoning": True,
             "input": (["text", "image"] if prefix == "gemini" else ["text"]),
             "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
         }

@@ -339,6 +339,19 @@ def test_models_metadata(proxy):
     assert "cost" in m
 
 
+def test_models_metadata_reasoning_without_yaml_thinking(tmp_path):
+    """Pi must be able to send thinking controls even when YAML omits thinking."""
+    backend = _make_backend(tmp_path, """
+backend:
+  models:
+    - name: openai/dummy
+      api_key: x
+      max_tokens: 8192
+""")
+    meta = backend.get_models_response()["data"][0]
+    assert meta["reasoning"] is True
+
+
 def test_openai_stream_replay_echoes_model(proxy):
     body = {
         "model": "my-client-model",
@@ -966,3 +979,21 @@ def test_gen_models_json_discovers_global(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
     monkeypatch.chdir(empty)
     assert mod.discover_turbo_agent_yaml() == str(gdir / "turbo-agent.yaml")
+
+
+def test_gen_models_json_reasoning_is_always_on(tmp_path):
+    import importlib.util
+
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "gen_models_json",
+        root / "integrations" / "pi" / "gen_models_json.py",
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    entry = mod.model_entry({"name": "openai/no-thinking", "max_tokens": 8192})
+    assert entry["reasoning"] is True
+    assert entry["thinkingLevelMap"]["high"] == "high"
+    block = mod.provider_block([{"name": "openai/no-thinking"}])
+    assert block["providers"]["turbo"]["compat"]["supportsReasoningEffort"] is True

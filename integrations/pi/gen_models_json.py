@@ -49,7 +49,13 @@ def model_entry(model: dict) -> dict:
     return {
         "id": name,
         "name": f"Turbo Agent ({name})",
-        "reasoning": model.get("thinking") is not None,
+        "reasoning": True,  # Pi thinking UI; proxy honors client effort
+        "thinkingLevelMap": {
+            "off": "none",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+        },
         "input": (["text", "image"] if prefix == "gemini" else ["text"]),
         "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
         "contextWindow": model.get("context_window")
@@ -65,7 +71,10 @@ def provider_block(models: list) -> dict:
                 "baseUrl": "http://localhost:8888/v1",
                 "api": "openai-completions",
                 "apiKey": "turbo-agent-local",  # the proxy ignores auth
-                "compat": {"supportsDeveloperRole": False},
+                "compat": {
+                    "supportsDeveloperRole": False,
+                    "supportsReasoningEffort": True,
+                },
                 "models": [model_entry(m) for m in models],
             }
         }
