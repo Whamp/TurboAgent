@@ -101,8 +101,7 @@ window and max tokens come from your config, so what Pi shows matches what the
 proxy runs). Then, with the proxy running:
 
 ```bash
-turbo-agent               # from a directory containing turbo-agent.yaml
-# or from anywhere: turbo-agent --config /path/to/turbo-agent.yaml
+turbo-agent               # project config, or the global default when none
 pi                        # select the model with /model: turbo/<backend-model>
 ```
 
@@ -137,7 +136,21 @@ Notes:
 
 ## Configuration
 
-Edit `turbo-agent.yaml`. API keys can reference environment variables with `$VAR_NAME` syntax. See the reference `turbo-agent.yaml` file for reference and usage.
+Edit `turbo-agent.yaml`. API keys can reference environment variables with
+`$VAR_NAME` syntax. See the reference `turbo-agent.yaml` file for reference
+and usage.
+
+Config discovery works like pi's settings files — a project config, then a
+global default:
+
+1. `--config PATH` (explicit, always wins)
+2. `./turbo-agent.yaml` in the current directory (project-level)
+3. `~/.config/turbo-agent/turbo-agent.yaml` (global default, used only when
+   the project file doesn't exist; honors `$XDG_CONFIG_HOME`)
+
+A project file fully replaces the global one (no merging). The `.env` file
+with API keys is always loaded from the same directory as the config that
+was chosen, so a global config reads `~/.config/turbo-agent/.env`.
 
 ### Model prefixes
 

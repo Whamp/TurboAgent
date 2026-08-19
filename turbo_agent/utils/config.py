@@ -69,15 +69,38 @@ _DEFAULT_CRITERIA = [
 
 
 class Config:
+    # Global fallback config, used when the current directory has no
+    # turbo-agent.yaml (same idea as pi's ~/.pi/agent/settings.json global
+    # default). Explicit --config PATH and a project-level file both win
+    # over this.
+    @staticmethod
+    def global_dir() -> Path:
+        """~/.config/turbo-agent (or $XDG_CONFIG_HOME/turbo-agent)."""
+        base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+        return Path(base) / "turbo-agent"
+
+    @staticmethod
+    def _discover() -> Path:
+        """Find the config to use: project-level ./turbo-agent.yaml first,
+        then the global ~/.config/turbo-agent/turbo-agent.yaml default."""
+        candidates = [
+            Path.cwd() / "turbo-agent.yaml",
+            Config.global_dir() / "turbo-agent.yaml",
+        ]
+        for c in candidates:
+            if c.is_file():
+                return c
+        raise FileNotFoundError(
+            "No turbo-agent.yaml found. Looked for:\n  "
+            + "\n  ".join(str(c) for c in candidates)
+            + "\nCreate one, or pass --config PATH."
+        )
+
     def __init__(self, config_path: Optional[str] = None):
         if config_path is None:
-            config_path = str(Path.cwd() / "turbo-agent.yaml")
-            if not Path(config_path).exists():
-                raise FileNotFoundError(
-                    f"No turbo-agent.yaml found in {Path.cwd()}. "
-                    "Run turbo-agent from a directory containing a "
-                    "turbo-agent.yaml config file, or pass --config PATH."
-                )
+            config_path = str(self._discover())
+        else:
+            config_path = str(Path(config_path))
 
         # Load .env from the same directory as the config file.
         env_path = Path(config_path).parent / ".env"

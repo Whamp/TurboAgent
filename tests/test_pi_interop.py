@@ -513,3 +513,37 @@ verifier:
     p2 = tmp_path / "no-verifier.yaml"
     p2.write_text("backend:\n  models:\n    - name: openai/dummy\n      api_key: x\n")
     assert Config(str(p2)).verifier_config is None
+
+
+def test_config_discovery_precedence(tmp_path, monkeypatch):
+    """Project ./turbo-agent.yaml beats the global default; global is used
+    when no project file exists; an explicit --config path always wins."""
+    xdg = tmp_path / "xdg"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    global_cfg = Config.global_dir() / "turbo-agent.yaml"
+    global_cfg.parent.mkdir(parents=True)
+    global_cfg.write_text(
+        "backend:\n  models:\n    - name: openai/global\n      api_key: g\n")
+
+    # no project file in cwd -> global default
+    monkeypatch.chdir(tmp_path)
+    assert Config().models[0]["name"] == "openai/global"
+
+    # project file exists -> it wins
+    (tmp_path / "turbo-agent.yaml").write_text(
+        "backend:\n  models:\n    - name: openai/project\n      api_key: p\n")
+    assert Config().models[0]["name"] == "openai/project"
+
+    # explicit path beats both
+    other = tmp_path / "elsewhere.yaml"
+    other.write_text(
+        "backend:\n  models:\n    - name: openai/explicit\n      api_key: e\n")
+    assert Config(str(other)).models[0]["name"] == "openai/explicit"
+
+    # nothing anywhere -> clear error listing the candidates
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "empty-xdg"))
+    other_dir = tmp_path / "elsewhere"
+    other_dir.mkdir(exist_ok=True)
+    monkeypatch.chdir(other_dir)
+    with pytest.raises(FileNotFoundError, match="No turbo-agent.yaml found"):
+        Config()
