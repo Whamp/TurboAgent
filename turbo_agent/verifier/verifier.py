@@ -70,6 +70,10 @@ class SelectionResult:
 
 
 class Verifier:
+    # Distinct from None: None means "let llm-verifier build from the env"
+    # (keyless gemini/*). _UNSET means the client has not been resolved yet.
+    _UNSET = object()
+
     def __init__(self, cfg: VerifierConfig):
         self.cfg = cfg
         self.method = cfg.method
@@ -78,7 +82,7 @@ class Verifier:
             [{"name": c.name, "description": c.description}
              for c in self.method.criteria]
         )
-        self._client = None  # created lazily on first scoring call
+        self._client = self._UNSET  # created lazily on first scoring call
         _logger.info(
             f"Verifier: model={cfg.model.name}, method=pivot_tournament, "
             f"pivots={self.method.pivots}, K={self.method.n_verifications}, "
@@ -107,19 +111,24 @@ class Verifier:
         ``None`` (gemini with no key) lets llm-verifier create a client
         from the environment.
         """
-        if self._client is not None:
+        if self._client is not self._UNSET:
             return self._client
 
         name = self.cfg.model.name
         api_key = self.cfg.model.api_key
         base_url = self.cfg.model.base_url
 
-        if name.startswith("gemini/") and api_key:
-            from google import genai
-            if self.cfg.model.provider == "vertex_ai":
-                self._client = genai.Client(vertexai=True, api_key=api_key)
+        if name.startswith("gemini/"):
+            if api_key:
+                from google import genai
+                if self.cfg.model.provider == "vertex_ai":
+                    self._client = genai.Client(vertexai=True, api_key=api_key)
+                else:
+                    self._client = genai.Client(api_key=api_key)
             else:
-                self._client = genai.Client(api_key=api_key)
+                # No key in the config: llm-verifier.create_gemini_client
+                # reads VERTEX_API_KEY from the environment.
+                self._client = None
         elif name.startswith("deepseek/"):
             self._client = create_deepseek_client(api_key=api_key)
         else:

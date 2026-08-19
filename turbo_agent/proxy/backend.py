@@ -366,6 +366,7 @@ class Backend:
 
     # Stashed on params by the request builders; stripped before litellm.
     _CLIENT_SUPPLIED_KEYS = "_client_supplied_keys"
+    _CLIENT_SENT_THINKING = "_client_sent_thinking"
 
     def _client_intent(self, params_base: dict) -> dict:
         """Values the client actually sent, re-asserted after the per-candidate
@@ -385,21 +386,27 @@ class Backend:
         YAML siblings must not stay on the wire.
         """
         sent = set(params_base.get(cls._CLIENT_SUPPLIED_KEYS, ()))
-        if not sent:
-            return
         if "max_completion_tokens" in sent and "max_tokens" not in sent:
             params.pop("max_tokens", None)
         if "max_tokens" in sent and "max_completion_tokens" not in sent:
             params.pop("max_completion_tokens", None)
-        if "reasoning_effort" in sent and "thinking_budget" not in sent:
+        # A client thinking object replaces YAML thinking wholesale, including
+        # type=disabled (no effort/budget keys) and budget-only vs effort-only.
+        if params_base.get(cls._CLIENT_SENT_THINKING):
+            if "reasoning_effort" not in sent:
+                params.pop("reasoning_effort", None)
+            if "thinking_budget" not in sent:
+                params.pop("thinking_budget", None)
+        elif "reasoning_effort" in sent and "thinking_budget" not in sent:
             params.pop("thinking_budget", None)
-        if "thinking_budget" in sent and "reasoning_effort" not in sent:
+        elif "thinking_budget" in sent and "reasoning_effort" not in sent:
             params.pop("reasoning_effort", None)
 
     @classmethod
     def _public_llm_params(cls, params: dict) -> dict:
         """Drop internal bookkeeping keys before calling litellm."""
-        return {k: v for k, v in params.items() if k != cls._CLIENT_SUPPLIED_KEYS}
+        skip = {cls._CLIENT_SUPPLIED_KEYS, cls._CLIENT_SENT_THINKING}
+        return {k: v for k, v in params.items() if k not in skip}
 
     @classmethod
     def _record_client_keys(cls, params: dict, keys: list) -> None:
@@ -433,7 +440,7 @@ class Backend:
             if b >= mt:
                 # Anthropic requires budget_tokens >= 1024 and < max_tokens;
                 # a window too small for a valid budget drops thinking.
-                if mt > 2048:
+                if mt >= 2048:
                     params["thinking_budget"] = min(b, mt - 1024)
                 else:
                     params.pop("thinking_budget", None)
@@ -485,8 +492,17 @@ class Backend:
         if isinstance(thinking, dict):
             params.pop("reasoning_effort", None)
             params.pop("thinking_budget", None)
-            if thinking.get("type") == "adaptive" or thinking.get("effort"):
-                params["reasoning_effort"] = thinking.get("effort", "high")
+            params[self._CLIENT_SENT_THINKING] = True
+            # Pi adaptive thinking puts effort on output_config, not
+            # thinking.effort. Honor either, plus a top-level effort field.
+            output_config = anthropic_body.get("output_config")
+            effort = thinking.get("effort")
+            if not effort and isinstance(output_config, dict):
+                effort = output_config.get("effort")
+            if not effort:
+                effort = anthropic_body.get("effort")
+            if thinking.get("type") == "adaptive" or effort:
+                params["reasoning_effort"] = effort or "high"
                 client_keys.append("reasoning_effort")
             budget = thinking.get("budget_tokens")
             if budget:

@@ -120,9 +120,10 @@ class Config:
 
     def _expand_env_vars(self) -> None:
         for model in self.models:
-            key = model.get("api_key", "")
-            if isinstance(key, str) and key.startswith("$"):
-                model["api_key"] = self._resolve_env(key)
+            for field in ("api_key", "base_url"):
+                val = model.get(field, "")
+                if isinstance(val, str) and val.startswith("$"):
+                    model[field] = self._resolve_env(val)
 
     # ------------------------------------------------------------------
     # Backend

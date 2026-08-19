@@ -17,6 +17,7 @@ import json
 import os
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -761,3 +762,201 @@ verifier:
     v = Verifier(Config(str(p)).verifier_config)
     assert "127.0.0.1:9" in str(v.client.base_url)
     assert "api.openai.com" not in str(v.client.base_url)
+
+
+def test_client_budget_clears_yaml_reasoning_effort(tmp_path, monkeypatch):
+    """YAML thinking: high must not survive a client budget_tokens request
+    on the verifier gather path."""
+    import asyncio
+
+    import turbo_agent.proxy.backend as bmod
+
+    backend = _make_backend(tmp_path, """
+backend:
+  models:
+    - name: openai/dummy
+      api_key: x
+      num_candidates: 3
+      max_tokens: 65536
+      thinking: high
+verifier:
+  model: {name: openai/dummy, api_key: x}
+  majority_voting: true
+  method: {name: pivot_tournament, pivots: 1, n_verifications: 1, seed: 0}
+""")
+    seen = []
+
+    async def fake(**kw):
+        seen.append((kw.get("reasoning_effort"), kw.get("thinking_budget")))
+        return dict(_CANNED_OK)
+
+    monkeypatch.setattr(bmod, "llm_completion", fake)
+    asyncio.run(backend.complete_anthropic(json.dumps({
+        "model": "claude-x",
+        "max_tokens": 32000,
+        "thinking": {"type": "enabled", "budget_tokens": 4096},
+        "messages": [{"role": "user", "content": "hi"}],
+    })))
+    assert seen == [(None, 4096)] * 3
+
+
+def test_pi_adaptive_reads_output_config_effort(tmp_path):
+    """Pi anthropic-messages puts adaptive effort on output_config."""
+    backend = _make_backend(tmp_path, """
+backend:
+  models:
+    - name: openai/dummy
+      api_key: x
+      max_tokens: 65536
+      thinking: high
+""")
+    params, _ = backend._build_anthropic_params({
+        "model": "claude-opus-4-6",
+        "max_tokens": 32000,
+        "thinking": {"type": "adaptive", "display": "summarized"},
+        "output_config": {"effort": "low"},
+        "messages": [],
+    })
+    assert params.get("reasoning_effort") == "low"
+    assert "thinking_budget" not in params
+
+
+def test_thinking_disabled_clears_yaml_thinking(tmp_path, monkeypatch):
+    import asyncio
+
+    import turbo_agent.proxy.backend as bmod
+
+    backend = _make_backend(tmp_path, """
+backend:
+  models:
+    - name: openai/dummy
+      api_key: x
+      num_candidates: 2
+      max_tokens: 4096
+      thinking: high
+verifier:
+  model: {name: openai/dummy, api_key: x}
+  majority_voting: true
+  method: {name: pivot_tournament, pivots: 1, n_verifications: 1, seed: 0}
+""")
+    seen = []
+
+    async def fake(**kw):
+        seen.append((kw.get("reasoning_effort"), kw.get("thinking_budget")))
+        return dict(_CANNED_OK)
+
+    monkeypatch.setattr(bmod, "llm_completion", fake)
+    asyncio.run(backend.complete_anthropic(json.dumps({
+        "model": "m",
+        "max_tokens": 2048,
+        "thinking": {"type": "disabled"},
+        "messages": [{"role": "user", "content": "hi"}],
+    })))
+    assert seen == [(None, None)] * 2
+
+
+def test_gemini_keyless_judge_uses_env_fallback(tmp_path, monkeypatch):
+    """gemini/* with no api_key must not ask for OPENAI_BASE_URL."""
+    from turbo_agent.verifier import Verifier
+
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_BASE", raising=False)
+    p = tmp_path / "g.yaml"
+    p.write_text("""
+backend:
+  models:
+    - name: openai/dummy
+      api_key: x
+verifier:
+  model: {name: gemini/gemini-2.5-flash}
+  method: {name: pivot_tournament, pivots: 1, n_verifications: 1}
+""")
+    v = Verifier(Config(str(p)).verifier_config)
+    assert v.client is None
+
+
+def test_budget_floor_at_2048(tmp_path):
+    """max_tokens == 2048 still has room for a 1024 thinking budget."""
+    backend = _make_backend(tmp_path, """
+backend:
+  models:
+    - name: openai/dummy
+      api_key: x
+      max_tokens: 65536
+      thinking: 2048
+""")
+    params, _ = backend._build_anthropic_params({
+        "model": "m", "max_tokens": 2048, "messages": [],
+    })
+    assert params.get("thinking_budget") == 1024
+
+
+def test_count_tokens_counts_images(proxy):
+    body = {
+        "model": "m",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "see"},
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/png", "data": "AA",
+                }},
+            ],
+        }],
+    }
+    resp = proxy.post("/v1/messages/count_tokens", json=body)
+    assert resp.status_code == 200
+    assert resp.json()["input_tokens"] >= 1600
+
+
+def test_check_api_key_loads_global_env(tmp_path, monkeypatch):
+    """turbo-agent check follows Config discovery, not only cwd."""
+    from turbo_agent import check_api_key
+
+    xdg = tmp_path / "xdg"
+    gdir = xdg / "turbo-agent"
+    gdir.mkdir(parents=True)
+    (gdir / "turbo-agent.yaml").write_text(
+        "backend:\n  models:\n    - name: openai/global\n      api_key: $GK\n")
+    (gdir / ".env").write_text("GK=from-global-env\n")
+    empty = tmp_path / "emptycwd"
+    empty.mkdir()
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    monkeypatch.chdir(empty)
+    monkeypatch.delenv("GK", raising=False)
+
+    def skip(self):
+        return check_api_key.CheckResult(
+            self.name, self.env_var, "skip", "skipped", self.roles)
+
+    monkeypatch.setattr(check_api_key.GeminiChecker, "run", skip)
+    monkeypatch.setattr(check_api_key.VertexChecker, "run", skip)
+    monkeypatch.setattr(check_api_key.OpenAIChecker, "run", skip)
+    monkeypatch.setattr(check_api_key.AnthropicChecker, "run", skip)
+
+    rc = check_api_key.main()
+    assert rc == 0
+    assert os.environ.get("GK") == "from-global-env"
+
+
+def test_gen_models_json_discovers_global(tmp_path, monkeypatch):
+    import importlib.util
+
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "gen_models_json",
+        root / "integrations" / "pi" / "gen_models_json.py",
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    xdg = tmp_path / "xdg"
+    gdir = xdg / "turbo-agent"
+    gdir.mkdir(parents=True)
+    (gdir / "turbo-agent.yaml").write_text(
+        "backend:\n  models:\n    - name: openai/from-global\n      api_key: g\n")
+    empty = tmp_path / "emptycwd"
+    empty.mkdir()
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    monkeypatch.chdir(empty)
+    assert mod.discover_turbo_agent_yaml() == str(gdir / "turbo-agent.yaml")

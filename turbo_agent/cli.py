@@ -14,7 +14,10 @@ def main() -> None:
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument(
         "-c", "--config", type=str, default=None,
-        help="Path to turbo-agent.yaml (default: ./turbo-agent.yaml)",
+        help=(
+            "Path to turbo-agent.yaml. Default: ./turbo-agent.yaml, then "
+            "~/.config/turbo-agent/turbo-agent.yaml"
+        ),
     )
     subparsers = parser.add_subparsers(dest="command")
     subparsers.add_parser("check", help="Check provider API keys")
@@ -23,7 +26,7 @@ def main() -> None:
     if args.command == "check":
         from . import check_api_key
 
-        sys.exit(check_api_key.main())
+        sys.exit(check_api_key.main(args.config))
 
     server = ProxyServer(config=Config(args.config) if args.config else None)
 

@@ -15,6 +15,7 @@ pivot-tournament verifier depends on them.
 
 Usage:
     turbo-agent check
+    turbo-agent --config PATH check
 """
 
 import os
@@ -26,7 +27,8 @@ from typing import List, Optional, Tuple
 
 import httpx
 
-# .env and turbo-agent.yaml are resolved from the directory the user runs in.
+# .env and turbo-agent.yaml follow Config discovery (project file, then the
+# XDG global default) unless --config PATH is passed.
 ROOT = Path.cwd()
 
 # Keywords that mark an error as an authentication / key problem (vs. anything
@@ -198,15 +200,10 @@ class VertexChecker(ProviderChecker):
         return "warn", "generation OK but no logprobs returned (verifier needs them)"
 
 
-def _roles_from_config() -> dict:
+def _roles_from_raw(raw: dict) -> dict:
     """Map env-var name -> roles (which config slots reference it), so the
     report shows what each key is actually used for. Best-effort."""
     roles: dict = {}
-    try:
-        import yaml
-        raw = yaml.safe_load((ROOT / "turbo-agent.yaml").read_text()) or {}
-    except Exception:
-        return roles
 
     def note(api_key_ref, role):
         if isinstance(api_key_ref, str) and api_key_ref.startswith("$"):
@@ -214,11 +211,21 @@ def _roles_from_config() -> dict:
 
     for m in raw.get("backend", {}).get("models", []):
         note(m.get("api_key"), "backend")
-    vmodel = raw.get("verifier", {}).get("model", {})
+    vmodel = raw.get("verifier", {}).get("model", {}) or {}
     note(vmodel.get("api_key"), "verifier")
     ctx = raw.get("context", {}).get("refinement_model", {})
     note(ctx.get("api_key"), "context")
     return roles
+
+
+def _roles_from_config() -> dict:
+    """CWD fallback when no discovered config file exists."""
+    try:
+        import yaml
+        raw = yaml.safe_load((ROOT / "turbo-agent.yaml").read_text()) or {}
+    except Exception:
+        return {}
+    return _roles_from_raw(raw)
 
 
 def _load_dotenv() -> None:
@@ -237,9 +244,26 @@ def _load_dotenv() -> None:
                                       v.strip().strip('"').strip("'"))
 
 
-def main() -> int:
-    _load_dotenv()
-    config_roles = _roles_from_config()
+def main(config_path: Optional[str] = None) -> int:
+    from .utils.config import Config
+
+    config_roles: dict = {}
+    explicit = config_path is not None
+    try:
+        if config_path is None:
+            config_path = str(Config._discover())
+        # Roles must be read from the unexpanded YAML ($VAR names). Config()
+        # expands api_key in place, which would hide those names.
+        import yaml
+        raw = yaml.safe_load(Path(config_path).read_text()) or {}
+        config_roles = _roles_from_raw(raw)
+        Config(config_path)  # load the chosen file's .env
+    except FileNotFoundError as e:
+        if explicit:
+            print(e, file=sys.stderr)
+            return 1
+        _load_dotenv()
+        config_roles = _roles_from_config()
 
     checkers: List[ProviderChecker] = [
         GeminiChecker(),

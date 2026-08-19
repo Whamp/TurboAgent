@@ -105,13 +105,29 @@ class ProxyServer:
             content={"input_tokens": self._estimate_anthropic_tokens(anthropic_body)}
         )
 
+    # Anthropic bills ~1.2k-1.6k tokens per image. Count a conservative
+    # floor so image-heavy turns are not estimated as near-zero.
+    _IMAGE_TOKEN_ESTIMATE = 1600
+
     @staticmethod
     def _estimate_anthropic_tokens(body: dict) -> int:
-        """Rough ~4 chars/token estimate over all text in the request."""
+        """Rough ~4 chars/token over text, plus a per-image floor.
+
+        Images (including those inside tool_result) are counted; cache_control
+        is ignored. Pi counts tokens locally; this exists so other clients
+        never fall through to api.anthropic.com.
+        """
         total = 0
 
         def text_len(text: str) -> int:
             return (len(text) + 3) // 4
+
+        def add_image_block(block: dict) -> int:
+            return (
+                ProxyServer._IMAGE_TOKEN_ESTIMATE
+                if block.get("type") == "image"
+                else 0
+            )
 
         system = body.get("system")
         if isinstance(system, str):
@@ -132,6 +148,8 @@ class ProxyServer:
                     btype = block.get("type")
                     if btype == "text" and block.get("text"):
                         total += text_len(block["text"])
+                    elif btype == "image":
+                        total += add_image_block(block)
                     elif btype == "tool_use" and block.get("input"):
                         total += text_len(json.dumps(block["input"]))
                     elif btype == "tool_result":
@@ -142,6 +160,8 @@ class ProxyServer:
                             for b in tc:
                                 if isinstance(b, dict) and b.get("text"):
                                     total += text_len(b["text"])
+                                elif isinstance(b, dict) and b.get("type") == "image":
+                                    total += add_image_block(b)
                                 elif isinstance(b, str):
                                     total += text_len(b)
         return total
