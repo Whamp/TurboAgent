@@ -11,6 +11,10 @@ import litellm
 # Suppress litellm's verbose logging
 litellm.suppress_debug_info = True
 
+# Drop provider params a backend doesn't support (e.g. reasoning_effort for
+# OpenAI-family models that lack it) instead of failing the whole request.
+litellm.drop_params = True
+
 # Disable litellm's Anthropic/Gemini context-caching transform. Otherwise litellm
 # creates explicit Google CachedContent resources and then references them in the
 # same generateContent call that still carries system_instruction/tools, which the
