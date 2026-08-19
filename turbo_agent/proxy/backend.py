@@ -350,11 +350,39 @@ class Backend:
                 )
         return "\n".join(parts) if parts else "(empty response)"
 
+    def _apply_token_limits(self, params: dict) -> None:
+        """Clamp client-provided token caps to the configured backend cap and
+        keep the thinking budget strictly below max_tokens (Gemini-style
+        thinking needs output headroom outside the budget)."""
+        config_max = self.config.default_model.get("max_tokens")
+        for key in ("max_tokens", "max_completion_tokens"):
+            val = params.get(key)
+            if config_max and val:
+                params[key] = min(int(val), int(config_max))
+            elif config_max and not val:
+                params[key] = int(config_max)
+            elif val:
+                params[key] = int(val)
+
+        budget = params.get("thinking_budget")
+        max_tokens = params.get("max_tokens")
+        if budget and max_tokens and int(budget) >= int(max_tokens):
+            params["thinking_budget"] = max(1024, int(max_tokens) - 1024)
+
     # ------------------------------------------------------------------
     # Anthropic-format API
     # ------------------------------------------------------------------
 
-    def _build_anthropic_params(self, anthropic_body: dict) -> dict:
+    def _build_anthropic_params(
+        self, anthropic_body: dict,
+    ) -> Tuple[dict, str]:
+        """Build backend params from an Anthropic-format request.
+
+        Returns (params, requested_model). The requested model id is echoed
+        back to the client in responses; the actual backend model comes from
+        the config.
+        """
+        requested_model = anthropic_body.get("model", self.model_name)
         params: dict = {
             **self._base_params(),
             "messages": AnthropicToOpenAI.messages(anthropic_body),
@@ -375,7 +403,18 @@ class Backend:
                 anthropic_body["tool_choice"]
             )
 
-        return params
+        # Honor the client's thinking request when present; the config's
+        # thinking settings remain the default for requests that omit it.
+        thinking = anthropic_body.get("thinking")
+        if isinstance(thinking, dict):
+            if thinking.get("type") == "adaptive" or thinking.get("effort"):
+                params["reasoning_effort"] = thinking.get("effort", "high")
+            budget = thinking.get("budget_tokens")
+            if budget:
+                params["thinking_budget"] = int(budget)
+
+        self._apply_token_limits(params)
+        return params, requested_model
 
     async def complete_anthropic(
         self, body: bytes | str,
@@ -391,7 +430,7 @@ class Backend:
         req_log = create_request_log("anthropic", self._sanitized_config())
         req_log["request"] = anthropic_body
 
-        params = self._build_anthropic_params(anthropic_body)
+        params, requested_model = self._build_anthropic_params(anthropic_body)
         params = await self._refine_messages(params, req_log)
         params.pop("stream", None)
 
@@ -407,14 +446,14 @@ class Backend:
             response, model_name = await self._pick_best(
                 responses, params["messages"], req_log,
             )
-            final_result = OpenAIToAnthropic.response(response, model_name)
+            final_result = OpenAIToAnthropic.response(response, requested_model)
         else:
             logger.info(f"BACKEND calling {self.model_name} (anthropic)")
             response = await llm_completion(**params)
             req_log["responses"] = [
                 {"model": self.model_name, "response": response}
             ]
-            final_result = OpenAIToAnthropic.response(response, self.model_name)
+            final_result = OpenAIToAnthropic.response(response, requested_model)
 
         req_log["finalResponse"] = final_result
         req_log["elapsedMs"] = (time.monotonic() - start) * 1000
@@ -434,7 +473,7 @@ class Backend:
         )
         req_log["request"] = anthropic_body
 
-        params = self._build_anthropic_params(anthropic_body)
+        params, requested_model = self._build_anthropic_params(anthropic_body)
         params = await self._refine_messages(params, req_log)
 
         # When the verifier is active, collect all responses, verify, replay.
@@ -454,7 +493,9 @@ class Backend:
             req_log["elapsedMs"] = (time.monotonic() - start) * 1000
             save_request_log(req_log, self.config.log_dir)
             self._spawn_progress(params["messages"], best_resp, req_log)
-            async for event in self._replay_anthropic_sse(best_resp, best_model):
+            async for event in self._replay_anthropic_sse(
+                best_resp, requested_model,
+            ):
                 yield event
             return
 
@@ -462,7 +503,7 @@ class Backend:
         logger.info(f"BACKEND streaming {self.model_name} (anthropic)")
 
         msg_id = f"msg_{uuid.uuid4().hex[:24]}"
-        yield SSEFormatter.message_start(self.model_name, msg_id)
+        yield SSEFormatter.message_start(requested_model, msg_id)
 
         stream = await llm_stream_completion(**params)
 
@@ -582,7 +623,8 @@ class Backend:
     # OpenAI-format API
     # ------------------------------------------------------------------
 
-    def _build_openai_params(self, openai_body: dict) -> dict:
+    def _build_openai_params(self, openai_body: dict) -> Tuple[dict, str]:
+        requested_model = openai_body.get("model", self.model_name)
         params: dict = {
             **self._base_params(),
             "messages": openai_body.get("messages", []),
@@ -591,7 +633,7 @@ class Backend:
         direct_keys = [
             "temperature", "top_p", "stop", "tools", "tool_choice",
             "response_format", "seed", "n", "presence_penalty",
-            "frequency_penalty", "logit_bias",
+            "frequency_penalty", "logit_bias", "reasoning_effort",
         ]
         for key in direct_keys:
             if key in openai_body:
@@ -606,7 +648,8 @@ class Backend:
         if openai_body.get("stream_options"):
             params["stream_options"] = openai_body["stream_options"]
 
-        return params
+        self._apply_token_limits(params)
+        return params, requested_model
 
     async def complete_openai(
         self, body: bytes | str,
@@ -622,7 +665,7 @@ class Backend:
         req_log = create_request_log("openai", self._sanitized_config())
         req_log["request"] = openai_body
 
-        params = self._build_openai_params(openai_body)
+        params, requested_model = self._build_openai_params(openai_body)
         params.pop("stream", None)
         params = await self._refine_messages(params, req_log)
 
@@ -646,6 +689,10 @@ class Backend:
                 {"model": self.model_name, "response": final_result}
             ]
 
+        # Echo the model the client asked for; the backend model stays in the
+        # request log for debugging.
+        final_result["model"] = requested_model
+
         req_log["finalResponse"] = final_result
         req_log["elapsedMs"] = (time.monotonic() - start) * 1000
         save_request_log(req_log, self.config.log_dir)
@@ -662,7 +709,7 @@ class Backend:
         req_log = create_request_log("openai_stream", self._sanitized_config())
         req_log["request"] = openai_body
 
-        params = self._build_openai_params(openai_body)
+        params, requested_model = self._build_openai_params(openai_body)
         params = await self._refine_messages(params, req_log)
 
         if self.verifier:
@@ -681,7 +728,7 @@ class Backend:
             req_log["elapsedMs"] = (time.monotonic() - start) * 1000
             save_request_log(req_log, self.config.log_dir)
             self._spawn_progress(params["messages"], best_resp, req_log)
-            async for event in self._replay_openai_sse(best_resp):
+            async for event in self._replay_openai_sse(best_resp, requested_model):
                 yield event
             return
 
@@ -693,12 +740,13 @@ class Backend:
             chunk_dict = (
                 chunk.model_dump() if hasattr(chunk, "model_dump") else chunk
             )
+            chunk_dict["model"] = requested_model
             yield f"data: {json.dumps(chunk_dict, default=str)}\n\n"
 
         yield "data: [DONE]\n\n"
 
     async def _replay_openai_sse(
-        self, response: dict,
+        self, response: dict, model_name: str,
     ) -> AsyncIterator[str]:
         choices = response.get("choices", [])
         choice = choices[0] if choices else {}
@@ -707,7 +755,7 @@ class Backend:
             "id": response.get("id", f"chatcmpl-{uuid.uuid4().hex[:24]}"),
             "object": "chat.completion.chunk",
             "created": response.get("created", 0),
-            "model": response.get("model", ""),
+            "model": model_name,
             "choices": [
                 {
                     "index": 0,
@@ -719,16 +767,37 @@ class Backend:
         yield f"data: {json.dumps(chunk, default=str)}\n\n"
         yield "data: [DONE]\n\n"
 
+    @staticmethod
+    def _model_metadata(model: dict) -> dict:
+        """Rich metadata for GET /v1/models. Pi and other clients use these
+        fields to register models with sane context/cost defaults."""
+        name = model["name"]
+        cfg_max = model.get("max_tokens")
+        prefix = name.split("/", 1)[0] if "/" in name else ""
+        context_defaults = {
+            "gemini": 1_000_000,
+            "openai": 200_000,
+            "anthropic": 200_000,
+            "openrouter": 200_000,
+            "kimi": 128_000,
+            "zai": 128_000,
+        }
+        return {
+            "id": name,
+            "object": "model",
+            "created": 0,
+            "owned_by": "turbo-agent",
+            "name": name,
+            "context_window": model.get("context_window")
+            or context_defaults.get(prefix, 128_000),
+            "max_tokens": cfg_max or 8192,
+            "reasoning": model.get("thinking") is not None,
+            "input": (["text", "image"] if prefix == "gemini" else ["text"]),
+            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+        }
+
     def get_models_response(self) -> dict:
         return {
             "object": "list",
-            "data": [
-                {
-                    "id": model["name"],
-                    "object": "model",
-                    "created": 0,
-                    "owned_by": "turbo-agent",
-                }
-                for model in self.config.models
-            ],
+            "data": [self._model_metadata(m) for m in self.config.models],
         }

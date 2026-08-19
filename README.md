@@ -82,6 +82,46 @@ ANTHROPIC_BASE_URL=http://localhost:8888 claude
 export OPENAI_API_BASE=http://localhost:8888/v1
 ```
 
+### Use with Pi
+
+[Pi](https://github.com/earendil-works/pi-coding-agent) connects through the
+proxy as an OpenAI-compatible client, which works with any backend model
+(Gemini, OpenAI, Anthropic, OpenRouter, Zai, Kimi, ...) in your
+`turbo-agent.yaml`.
+
+Pi keeps custom providers in `~/.pi/agent/models.json`. Generate the `turbo`
+provider block straight from your config:
+
+```bash
+python integrations/pi/gen_models_json.py turbo-agent.yaml --merge ~/.pi/agent/models.json
+```
+
+That registers one `turbo` model per backend model (metadata such as context
+window and max tokens come from your config, so what Pi shows matches what the
+proxy runs). Then, with the proxy running:
+
+```bash
+turbo-agent               # in a directory containing turbo-agent.yaml
+pi                        # select the model with /model: turbo/<backend-model>
+```
+
+Notes:
+
+- The proxy ignores the model id a client requests — it always runs the
+  backend models from `turbo-agent.yaml` — but it now echoes the requested id
+  back in responses, so Pi displays the model you picked.
+- The proxy ignores client API keys; the `apiKey` in the generated provider is
+  a placeholder. If Pi hides the models until auth is resolved, save any key
+  with `/login turbo` or pass `--api-key` when selecting the model.
+- Pi always streams. With a verifier configured, Turbo Agent gathers all
+  candidates and verifies before replaying the best response as a stream, so
+  each turn costs `num_candidates` full responses plus verifier calls. Tune
+  `num_candidates` (3 is the reference default) and `majority_voting: true`
+  to control cost/latency.
+- Pi counts tokens locally; the proxy also answers `/v1/messages/count_tokens`
+  with an approximate local count so token-counting clients never leak a
+  request to api.anthropic.com.
+
 ## Configuration
 
 Edit `turbo-agent.yaml`. API keys can reference environment variables with `$VAR_NAME` syntax. See the reference `turbo-agent.yaml` file for reference and usage.
@@ -100,6 +140,7 @@ Edit `turbo-agent.yaml`. API keys can reference environment variables with `$VAR
 | Endpoint | Format |
 |----------|--------|
 | `POST /v1/messages` | Anthropic |
+| `POST /v1/messages/count_tokens` | Anthropic (approximate local count) |
 | `POST /v1/chat/completions` | OpenAI |
 | `GET /v1/models` | OpenAI |
 | `GET /visualizer` | Pipeline visualizer UI |

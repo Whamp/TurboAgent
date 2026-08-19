@@ -86,7 +86,12 @@ def _build_kwargs(
     if reasoning_effort is not None:
         kwargs["reasoning_effort"] = reasoning_effort
     if thinking_budget is not None:
-        kwargs["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
+        # Budget-based thinking is an Anthropic Messages concept. litellm
+        # rejects the `thinking` param for OpenAI-family providers, and the
+        # reference Gemini backends ship `thinking: high` (reasoning_effort)
+        # instead, so only forward the budget payload to Anthropic backends.
+        if model.startswith("anthropic/"):
+            kwargs["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
     return kwargs
 
 

@@ -77,13 +77,16 @@ class AnthropicToOpenAI:
 
             if role == "assistant":
                 if text_only:
-                    openai_messages.append(
-                        AnthropicToOpenAI._convert_assistant_message_text_only(content)
-                    )
+                    converted = AnthropicToOpenAI._convert_assistant_message_text_only(content)
+                    if converted is not None:
+                        openai_messages.append(converted)
                 else:
-                    openai_messages.append(
-                        AnthropicToOpenAI._convert_assistant_message(content)
-                    )
+                    converted = AnthropicToOpenAI._convert_assistant_message(content)
+                    if converted is not None:
+                        openai_messages.append(converted)
+                    # None means the assistant turn had no text and no tool calls
+                    # (e.g. a pure-thinking turn). Dropping it keeps backends
+                    # that reject null-content assistant messages happy.
             elif role == "user":
                 if text_only:
                     openai_messages.extend(
@@ -128,6 +131,9 @@ class AnthropicToOpenAI:
         oai_msg["content"] = "\n".join(text_parts) if text_parts else None
         if tool_calls:
             oai_msg["tool_calls"] = tool_calls
+        elif not text_parts:
+            # Nothing to send: no text, no tool calls. Callers drop this message.
+            return None
         return oai_msg
 
     @staticmethod
@@ -155,6 +161,8 @@ class AnthropicToOpenAI:
             elif isinstance(block, str):
                 text_parts.append(block)
 
+        if not text_parts:
+            return None
         return {
             "role": "assistant",
             "content": "\n".join(text_parts) if text_parts else None,
@@ -164,15 +172,20 @@ class AnthropicToOpenAI:
     def _convert_user_message(content: list) -> list:
         results = []
         regular_parts = []
+        tool_images = []  # images found inside tool_result blocks
 
         for block in content:
             if isinstance(block, dict) and block.get("type") == "tool_result":
                 tr_content = block.get("content", "")
+                texts = []
                 if isinstance(tr_content, list):
-                    texts = []
                     for b in tr_content:
                         if isinstance(b, dict) and b.get("type") == "text":
                             texts.append(b["text"])
+                        elif isinstance(b, dict) and b.get("type") == "image":
+                            converted = AnthropicToOpenAI.content_block(b)
+                            if converted is not None:
+                                tool_images.append(converted)
                         elif isinstance(b, str):
                             texts.append(b)
                     tr_content = "\n".join(texts)
@@ -187,6 +200,11 @@ class AnthropicToOpenAI:
                     regular_parts.append(converted)
 
         msgs = list(results)
+
+        # Attach tool-result images to the trailing user message so Gemini
+        # (which does not render images inside functionResponse parts) still
+        # sees them as visual context in the same turn.
+        regular_parts.extend(tool_images)
 
         if regular_parts:
             if len(regular_parts) == 1 and isinstance(regular_parts[0], str):
@@ -299,7 +317,7 @@ class OpenAIToAnthropic:
             "type": "message",
             "role": "assistant",
             "content": content,
-            "model": oai_response.get("model", model_name),
+            "model": model_name,
             "stop_reason": stop_reason,
             "stop_sequence": None,
             "usage": usage_dict,

@@ -69,12 +69,82 @@ class ProxyServer:
         if method == "POST" and clean_path.endswith("/chat/completions"):
             return await self._handle_openai(request, path, body)
 
+        # --- Anthropic: POST /v1/messages/count_tokens (approximate, local) ---
+        if method == "POST" and clean_path.endswith("/messages/count_tokens"):
+            return await self._handle_count_tokens(body)
+
         # --- Anthropic: POST /v1/messages ---
         if method == "POST" and clean_path.endswith("/messages"):
             return await self._handle_anthropic(request, path, body)
 
         # --- Upstream passthrough ---
         return await self._handle_upstream(request, path, body)
+
+    # ------------------------------------------------------------------
+    # Anthropic: POST /v1/messages/count_tokens
+    # ------------------------------------------------------------------
+
+    async def _handle_count_tokens(self, body: bytes) -> Response:
+        """Approximate local token count so count_tokens requests never fall
+        through to the api.anthropic.com passthrough (which would bill the
+        client's real Anthropic key for a model the proxy never uses)."""
+        try:
+            anthropic_body = json.loads(body.decode() or "{}")
+        except json.JSONDecodeError:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "Invalid JSON",
+                    },
+                },
+            )
+        return JSONResponse(
+            content={"input_tokens": self._estimate_anthropic_tokens(anthropic_body)}
+        )
+
+    @staticmethod
+    def _estimate_anthropic_tokens(body: dict) -> int:
+        """Rough ~4 chars/token estimate over all text in the request."""
+        total = 0
+
+        def text_len(text: str) -> int:
+            return (len(text) + 3) // 4
+
+        system = body.get("system")
+        if isinstance(system, str):
+            total += text_len(system)
+        elif isinstance(system, list):
+            for block in system:
+                if isinstance(block, dict) and block.get("text"):
+                    total += text_len(block["text"])
+
+        for msg in body.get("messages", []):
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                total += text_len(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    btype = block.get("type")
+                    if btype == "text" and block.get("text"):
+                        total += text_len(block["text"])
+                    elif btype == "tool_use" and block.get("input"):
+                        total += text_len(json.dumps(block["input"]))
+                    elif btype == "tool_result":
+                        tc = block.get("content", "")
+                        if isinstance(tc, str):
+                            total += text_len(tc)
+                        elif isinstance(tc, list):
+                            for b in tc:
+                                if isinstance(b, dict) and b.get("text"):
+                                    total += text_len(b["text"])
+                                elif isinstance(b, str):
+                                    total += text_len(b)
+        return total
 
     # ------------------------------------------------------------------
     # Anthropic path
