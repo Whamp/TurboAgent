@@ -101,9 +101,14 @@ window and max tokens come from your config, so what Pi shows matches what the
 proxy runs). Then, with the proxy running:
 
 ```bash
-turbo-agent               # in a directory containing turbo-agent.yaml
+turbo-agent               # from a directory containing turbo-agent.yaml
+# or from anywhere: turbo-agent --config /path/to/turbo-agent.yaml
 pi                        # select the model with /model: turbo/<backend-model>
 ```
+
+The generated block is only stale when `turbo-agent.yaml` changes: a new Pi
+session just re-reads `~/.pi/agent/models.json` when you open `/model` (no
+regeneration needed).
 
 Notes:
 

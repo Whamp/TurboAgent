@@ -76,7 +76,7 @@ class Config:
                 raise FileNotFoundError(
                     f"No turbo-agent.yaml found in {Path.cwd()}. "
                     "Run turbo-agent from a directory containing a "
-                    "turbo-agent.yaml config file."
+                    "turbo-agent.yaml config file, or pass --config PATH."
                 )
 
         # Load .env from the same directory as the config file.
