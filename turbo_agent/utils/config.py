@@ -148,9 +148,15 @@ class Config:
         if not raw_v:
             return None
 
-        raw_model = raw_v.get("model")
-        if not raw_model or not raw_model.get("name"):
-            return None
+        raw_model = raw_v.get("model") or {}
+        if not raw_model.get("name"):
+            # The judge defaults to the active session's backend model when
+            # the verifier is enabled but no judge is named.
+            if not self.models:
+                return None
+            first = self.models[0]
+            raw_model = {"name": first.get("name"),
+                         "api_key": first.get("api_key")}
         raw_api_key = raw_model.get("api_key", "")
         raw_base_url = raw_model.get("base_url", "")
         model_cfg = ModelConfig(

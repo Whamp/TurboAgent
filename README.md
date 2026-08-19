@@ -120,11 +120,12 @@ Notes:
   to control cost/latency.
 - The verifier judge is configurable — it is not tied to Gemini. Set
   `verifier.model.name` to any litellm-style model: `openrouter/...`
-  (defaults to `https://openrouter.ai/api/v1`), `deepseek/...` (hosted DeepSeek),
-  or `openai/...` with a `base_url` pointing at a local vLLM/SGLang endpoint
-  (full fine-grained logprob reward needs a server that exposes logprobs;
-  OpenRouter degrades to parsing the judge's written score when the upstream
-  provider does not).
+  (defaults to `https://openrouter.ai/api/v1`), `deepseek/...` (hosted
+  DeepSeek), or `openai/...` with a `base_url` pointing at a local
+  vLLM/SGLang endpoint (full fine-grained logprob reward needs a server that
+  exposes logprobs; OpenRouter degrades to parsing the judge's written score
+  when the upstream provider does not). If `verifier.model` is omitted the
+  judge defaults to the backend candidate model.
 - Pi counts tokens locally; the proxy also answers `/v1/messages/count_tokens`
   with an approximate local count so token-counting clients never leak a
   request to api.anthropic.com.

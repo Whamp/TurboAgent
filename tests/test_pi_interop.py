@@ -485,3 +485,31 @@ verifier:
 
     v3 = Verifier(cfg("deepseek/deepseek-v4-flash"))
     assert getattr(v3.client, "_llm_verifier_deepseek", False)
+
+
+def test_verifier_judge_defaults_to_backend_model(tmp_path, monkeypatch):
+    """An enabled verifier without a named judge falls back to the backend
+    candidate model (the active session agent), not to disabled."""
+    monkeypatch.setenv("DUMMY_KEY", "dummy")
+    p = tmp_path / "turbo-agent.yaml"
+    p.write_text("""
+backend:
+  models:
+    - name: openrouter/deepseek/deepseek-v4-flash-0731
+      api_key: $DUMMY_KEY
+      num_candidates: 3
+
+verifier:
+  majority_voting: true
+  method: {name: pivot_tournament, pivots: 2, n_verifications: 1}
+""")
+    vc = Config(str(p)).verifier_config
+    assert vc is not None
+    assert vc.model.name == "openrouter/deepseek/deepseek-v4-flash-0731"
+    assert vc.model.api_key is not None       # key from the backend entry
+    assert vc.majority_voting is True
+
+    # verifier section absent -> still disabled
+    p2 = tmp_path / "no-verifier.yaml"
+    p2.write_text("backend:\n  models:\n    - name: openai/dummy\n      api_key: x\n")
+    assert Config(str(p2)).verifier_config is None
