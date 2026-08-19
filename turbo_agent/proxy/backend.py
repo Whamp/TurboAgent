@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 import time
 import uuid
@@ -169,12 +170,19 @@ class Backend:
             p = {**params_base, "model": name, "api_key": api_key, **model_params}
             p.pop("stream", None)
             # The YAML overlay must not undo the request's clamped caps or
-            # thinking settings: re-assert the request-derived values, then
-            # re-clamp against THIS entry's cap so the wire params are the
-            # effective ones for every candidate.
+            # thinking settings: re-assert only keys the client actually
+            # sent, drop overlay keys the client replaced, then re-clamp
+            # against THIS entry's cap.
             p.update(self._client_intent(params_base))
+            self._drop_overlay_keys_client_replaced(p, params_base)
             self._apply_token_limits(p, cap=model_params.get("max_tokens"))
-            resp = await llm_completion(**p)
+            # Isolate nested payloads so a mutating provider cannot leak
+            # into the next candidate (shared messages list).
+            if "messages" in p:
+                p["messages"] = copy.deepcopy(p["messages"])
+            if "tools" in p:
+                p["tools"] = copy.deepcopy(p["tools"])
+            resp = await llm_completion(**self._public_llm_params(p))
             return resp, name
 
         tasks = [call_model(entry) for entry in entries]
@@ -356,20 +364,46 @@ class Backend:
                 )
         return "\n".join(parts) if parts else "(empty response)"
 
-    # Keys derived from the client request (or the YAML default when the
-    # client was silent) that must survive the per-candidate YAML overlay.
-    _CLIENT_KEYS = (
-        "max_tokens", "max_completion_tokens", "temperature", "top_p",
-        "stop", "reasoning_effort", "thinking_budget", "tool_choice",
-    )
+    # Stashed on params by the request builders; stripped before litellm.
+    _CLIENT_SUPPLIED_KEYS = "_client_supplied_keys"
 
     def _client_intent(self, params_base: dict) -> dict:
-        """The request-derived values ``_gather_completions`` re-asserts after
-        the per-candidate YAML overlay, so client caps/thinking are not
-        silently replaced by the config for candidate calls."""
-        return {
-            k: params_base[k] for k in self._CLIENT_KEYS if k in params_base
-        }
+        """Values the client actually sent, re-asserted after the per-candidate
+        YAML overlay. YAML defaults (temperature, unused token field) stay
+        with the overlay so per-model config is not flattened to model[0]."""
+        keys = params_base.get(self._CLIENT_SUPPLIED_KEYS, ())
+        return {k: params_base[k] for k in keys if k in params_base}
+
+    @classmethod
+    def _drop_overlay_keys_client_replaced(
+        cls, params: dict, params_base: dict,
+    ) -> None:
+        """Remove YAML overlay keys the client replaced with a sibling field.
+
+        The overlay reintroduces per-model max_tokens / thinking. If the client
+        sent only max_completion_tokens (Pi) or only a thinking effort, those
+        YAML siblings must not stay on the wire.
+        """
+        sent = set(params_base.get(cls._CLIENT_SUPPLIED_KEYS, ()))
+        if not sent:
+            return
+        if "max_completion_tokens" in sent and "max_tokens" not in sent:
+            params.pop("max_tokens", None)
+        if "max_tokens" in sent and "max_completion_tokens" not in sent:
+            params.pop("max_completion_tokens", None)
+        if "reasoning_effort" in sent and "thinking_budget" not in sent:
+            params.pop("thinking_budget", None)
+        if "thinking_budget" in sent and "reasoning_effort" not in sent:
+            params.pop("reasoning_effort", None)
+
+    @classmethod
+    def _public_llm_params(cls, params: dict) -> dict:
+        """Drop internal bookkeeping keys before calling litellm."""
+        return {k: v for k, v in params.items() if k != cls._CLIENT_SUPPLIED_KEYS}
+
+    @classmethod
+    def _record_client_keys(cls, params: dict, keys: list) -> None:
+        params[cls._CLIENT_SUPPLIED_KEYS] = tuple(k for k in keys if k in params)
 
     def _apply_token_limits(self, params: dict, cap: int | None = None) -> None:
         """Clamp client-provided token caps to the backend cap and keep the
@@ -390,9 +424,11 @@ class Backend:
             params[key] = val if cap is None else min(val, int(cap))
 
         budget = params.get("thinking_budget")
-        max_tokens = params.get("max_tokens")
-        if budget is not None and max_tokens is not None:
-            mt = int(max_tokens)
+        output_cap = params.get("max_tokens")
+        if output_cap is None:
+            output_cap = params.get("max_completion_tokens")
+        if budget is not None and output_cap is not None:
+            mt = int(output_cap)
             b = int(budget)
             if b >= mt:
                 # Anthropic requires budget_tokens >= 1024 and < max_tokens;
@@ -420,13 +456,16 @@ class Backend:
             **self._base_params(),
             "messages": AnthropicToOpenAI.messages(anthropic_body),
         }
+        client_keys: list = []
 
         for key in ("max_tokens", "temperature", "top_p"):
             if key in anthropic_body:
                 params[key] = anthropic_body[key]
+                client_keys.append(key)
 
         if anthropic_body.get("stop_sequences"):
             params["stop"] = anthropic_body["stop_sequences"]
+            client_keys.append("stop")
         if "stream" in anthropic_body:
             params["stream"] = anthropic_body["stream"]
         if anthropic_body.get("tools"):
@@ -435,6 +474,7 @@ class Backend:
             params["tool_choice"] = AnthropicToOpenAI.tool_choice(
                 anthropic_body["tool_choice"]
             )
+            client_keys.append("tool_choice")
 
         # Honor the client's thinking request when present; the config's
         # thinking settings remain the default for requests that omit it.
@@ -447,11 +487,14 @@ class Backend:
             params.pop("thinking_budget", None)
             if thinking.get("type") == "adaptive" or thinking.get("effort"):
                 params["reasoning_effort"] = thinking.get("effort", "high")
+                client_keys.append("reasoning_effort")
             budget = thinking.get("budget_tokens")
             if budget:
                 params["thinking_budget"] = int(budget)
+                client_keys.append("thinking_budget")
 
         self._apply_token_limits(params)
+        self._record_client_keys(params, client_keys)
         return params, requested_model
 
     async def complete_anthropic(
@@ -487,7 +530,7 @@ class Backend:
             final_result = OpenAIToAnthropic.response(response, requested_model)
         else:
             logger.info(f"BACKEND calling {self.model_name} (anthropic)")
-            response = await llm_completion(**params)
+            response = await llm_completion(**self._public_llm_params(params))
             req_log["responses"] = [
                 {"model": self.model_name, "response": response}
             ]
@@ -543,7 +586,7 @@ class Backend:
         msg_id = f"msg_{uuid.uuid4().hex[:24]}"
         yield SSEFormatter.message_start(requested_model, msg_id)
 
-        stream = await llm_stream_completion(**params)
+        stream = await llm_stream_completion(**self._public_llm_params(params))
 
         block_index = 0
         text_block_open = False
@@ -667,6 +710,7 @@ class Backend:
             **self._base_params(),
             "messages": openai_body.get("messages", []),
         }
+        client_keys: list = []
 
         direct_keys = [
             "temperature", "top_p", "stop", "tools", "tool_choice",
@@ -676,11 +720,25 @@ class Backend:
         for key in direct_keys:
             if key in openai_body:
                 params[key] = openai_body[key]
+                if key in (
+                    "temperature", "top_p", "stop", "tool_choice",
+                    "reasoning_effort",
+                ):
+                    client_keys.append(key)
 
-        if openai_body.get("max_tokens"):
+        client_sent_max_tokens = bool(openai_body.get("max_tokens"))
+        client_sent_mct = bool(openai_body.get("max_completion_tokens"))
+        if client_sent_max_tokens:
             params["max_tokens"] = openai_body["max_tokens"]
-        if openai_body.get("max_completion_tokens"):
+            client_keys.append("max_tokens")
+        if client_sent_mct:
             params["max_completion_tokens"] = openai_body["max_completion_tokens"]
+            client_keys.append("max_completion_tokens")
+            # Pi sends only max_completion_tokens. Drop the YAML max_tokens
+            # planted by _base_params so a max_tokens-preferring backend
+            # cannot ignore the client cap.
+            if not client_sent_max_tokens:
+                params.pop("max_tokens", None)
         if "stream" in openai_body:
             params["stream"] = openai_body["stream"]
         if openai_body.get("stream_options"):
@@ -690,6 +748,7 @@ class Backend:
             params.pop("thinking_budget", None)
 
         self._apply_token_limits(params)
+        self._record_client_keys(params, client_keys)
         return params, requested_model
 
     async def complete_openai(
@@ -725,7 +784,7 @@ class Backend:
             final_result = response
         else:
             logger.info(f"BACKEND calling {self.model_name} (openai)")
-            final_result = await llm_completion(**params)
+            final_result = await llm_completion(**self._public_llm_params(params))
             req_log["responses"] = [
                 {"model": self.model_name, "response": final_result}
             ]
@@ -776,7 +835,7 @@ class Backend:
         params["stream"] = True
         logger.info(f"BACKEND streaming {self.model_name} (openai)")
 
-        stream = await llm_stream_completion(**params)
+        stream = await llm_stream_completion(**self._public_llm_params(params))
         async for chunk in stream:
             chunk_dict = (
                 chunk.model_dump() if hasattr(chunk, "model_dump") else chunk

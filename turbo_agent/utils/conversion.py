@@ -227,8 +227,14 @@ class AnthropicToOpenAI:
 
     @staticmethod
     def _convert_user_message_text_only(content: list) -> list:
-        """Convert user message, inlining tool results as text."""
+        """Convert user message, inlining tool results as text.
+
+        Images inside tool_result (and top-level image blocks) are kept as
+        OpenAI image_url parts so Gemini still sees screenshots when this
+        path is used.
+        """
         text_parts = []
+        image_parts = []
 
         for block in content:
             if isinstance(block, dict) and block.get("type") == "tool_result":
@@ -238,6 +244,10 @@ class AnthropicToOpenAI:
                     for b in tr_content:
                         if isinstance(b, dict) and b.get("type") == "text":
                             texts.append(b["text"])
+                        elif isinstance(b, dict) and b.get("type") == "image":
+                            converted = AnthropicToOpenAI.content_block(b)
+                            if converted is not None:
+                                image_parts.append(converted)
                         elif isinstance(b, str):
                             texts.append(b)
                     tr_content = "\n".join(texts)
@@ -246,15 +256,24 @@ class AnthropicToOpenAI:
                 )
             else:
                 converted = AnthropicToOpenAI.content_block(block)
-                if converted is not None:
-                    if isinstance(converted, str):
-                        text_parts.append(converted)
-                    elif isinstance(converted, dict) and converted.get("type") == "text":
-                        text_parts.append(converted["text"])
+                if converted is None:
+                    continue
+                if isinstance(converted, str):
+                    text_parts.append(converted)
+                elif isinstance(converted, dict) and converted.get("type") == "text":
+                    text_parts.append(converted["text"])
+                elif isinstance(converted, dict) and converted.get("type") == "image_url":
+                    image_parts.append(converted)
 
-        if not text_parts:
+        if not text_parts and not image_parts:
             return []
-        return [{"role": "user", "content": "\n".join(text_parts)}]
+        if not image_parts:
+            return [{"role": "user", "content": "\n".join(text_parts)}]
+        content_out: list = []
+        if text_parts:
+            content_out.append({"type": "text", "text": "\n".join(text_parts)})
+        content_out.extend(image_parts)
+        return [{"role": "user", "content": content_out}]
 
     @staticmethod
     def tools(anthropic_tools: list) -> list:

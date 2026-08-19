@@ -406,7 +406,7 @@ verifier:
                       "total_tokens": 2},
         }
 
-    bmod.llm_completion = fake
+    monkeypatch.setattr(bmod, "llm_completion", fake)
     asyncio.run(backend.complete_anthropic(json.dumps({
         "model": "claude-x",
         "max_tokens": 32000,
@@ -514,6 +514,27 @@ verifier:
     p2.write_text("backend:\n  models:\n    - name: openai/dummy\n      api_key: x\n")
     assert Config(str(p2)).verifier_config is None
 
+    # fallback copies base_url and provider from the backend model (local
+    # vLLM / Vertex) so the judge hits the same server the candidates do.
+    p3 = tmp_path / "local-backend.yaml"
+    p3.write_text("""
+backend:
+  models:
+    - name: openai/local-judge
+      api_key: k
+      base_url: http://127.0.0.1:30000/v1
+      provider: vertex_ai
+      num_candidates: 3
+
+verifier:
+  method: {name: pivot_tournament, pivots: 1, n_verifications: 1}
+""")
+    vc3 = Config(str(p3)).verifier_config
+    assert vc3 is not None
+    assert vc3.model.name == "openai/local-judge"
+    assert vc3.model.base_url == "http://127.0.0.1:30000/v1"
+    assert vc3.model.provider == "vertex_ai"
+
 
 def test_config_discovery_precedence(tmp_path, monkeypatch):
     """Project ./turbo-agent.yaml beats the global default; global is used
@@ -547,3 +568,196 @@ def test_config_discovery_precedence(tmp_path, monkeypatch):
     monkeypatch.chdir(other_dir)
     with pytest.raises(FileNotFoundError, match="No turbo-agent.yaml found"):
         Config()
+
+
+_CANNED_OK = {
+    "id": "x", "object": "chat.completion", "created": 1, "model": "dummy",
+    "choices": [{"index": 0,
+                 "message": {"role": "assistant", "content": "ok"},
+                 "finish_reason": "stop"}],
+    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+}
+
+
+def test_openai_client_mct_does_not_keep_yaml_max_tokens(tmp_path, monkeypatch):
+    """Pi sends max_completion_tokens only. YAML max_tokens must not stay
+    on the candidate payload (a max_tokens-preferring backend would ignore
+    the client cap)."""
+    import asyncio
+
+    import turbo_agent.proxy.backend as bmod
+
+    backend = _make_backend(tmp_path, """
+backend:
+  models:
+    - name: openai/dummy
+      api_key: x
+      num_candidates: 3
+      max_tokens: 65536
+      thinking: high
+verifier:
+  model: {name: openai/dummy, api_key: x}
+  majority_voting: true
+  method: {name: pivot_tournament, pivots: 1, n_verifications: 1, seed: 0}
+""")
+    seen = []
+
+    async def fake(**kw):
+        seen.append({
+            k: kw.get(k)
+            for k in ("max_tokens", "max_completion_tokens", "reasoning_effort")
+        })
+        return dict(_CANNED_OK)
+
+    monkeypatch.setattr(bmod, "llm_completion", fake)
+    asyncio.run(backend.complete_openai(json.dumps({
+        "model": "pi-label",
+        "max_completion_tokens": 100,
+        "reasoning_effort": "low",
+        "messages": [{"role": "user", "content": "hi"}],
+    })))
+    assert len(seen) == 3
+    for req in seen:
+        assert req["max_completion_tokens"] == 100
+        assert req["max_tokens"] is None
+        assert req["reasoning_effort"] == "low"
+
+
+def test_per_model_temperature_survives_when_client_omits_it(tmp_path, monkeypatch):
+    """YAML overlay temperatures must stick when the client did not send
+    temperature. Re-asserting default-model sampling flattened both."""
+    import asyncio
+
+    import turbo_agent.proxy.backend as bmod
+
+    backend = _make_backend(tmp_path, """
+backend:
+  models:
+    - name: openai/a
+      api_key: x
+      num_candidates: 1
+      temperature: 0.2
+      max_tokens: 1000
+    - name: openai/b
+      api_key: x
+      num_candidates: 1
+      temperature: 0.9
+      max_tokens: 2000
+verifier:
+  model: {name: openai/dummy, api_key: x}
+  majority_voting: true
+  method: {name: pivot_tournament, pivots: 1, n_verifications: 1, seed: 0}
+""")
+    seen = []
+
+    async def fake(**kw):
+        seen.append((kw.get("model"), kw.get("temperature"), kw.get("max_tokens")))
+        return dict(_CANNED_OK)
+
+    monkeypatch.setattr(bmod, "llm_completion", fake)
+    asyncio.run(backend.complete_anthropic(json.dumps({
+        "model": "m",
+        "max_tokens": 500,
+        "messages": [{"role": "user", "content": "hi"}],
+    })))
+    by_model = {name: (temp, mt) for name, temp, mt in seen}
+    assert by_model["openai/a"] == (0.2, 500)
+    assert by_model["openai/b"] == (0.9, 500)
+
+
+def test_candidate_messages_are_not_shared(tmp_path, monkeypatch):
+    """Each candidate must get its own messages list so a mutating provider
+    cannot append into the next candidate's payload."""
+    import asyncio
+
+    import turbo_agent.proxy.backend as bmod
+
+    backend = _make_backend(tmp_path, """
+backend:
+  models:
+    - name: openai/dummy
+      api_key: x
+      num_candidates: 3
+      max_tokens: 128
+verifier:
+  model: {name: openai/dummy, api_key: x}
+  majority_voting: true
+  method: {name: pivot_tournament, pivots: 1, n_verifications: 1, seed: 0}
+""")
+    captured = []
+
+    async def fake(**kw):
+        msgs = kw["messages"]
+        captured.append(msgs)
+        msgs.append({"role": "assistant", "content": "mutated"})
+        return dict(_CANNED_OK)
+
+    monkeypatch.setattr(bmod, "llm_completion", fake)
+    asyncio.run(backend.complete_anthropic(json.dumps({
+        "model": "m",
+        "max_tokens": 50,
+        "messages": [{"role": "user", "content": "hi"}],
+    })))
+    # Hold the lists so id() is not reused after GC; each candidate must
+    # see only its own mutation.
+    assert len(captured) == 3
+    assert len({id(m) for m in captured}) == 3
+    for msgs in captured:
+        assert sum(1 for m in msgs if m.get("content") == "mutated") == 1
+
+
+def test_text_only_preserves_tool_result_images():
+    from turbo_agent.utils.conversion import AnthropicToOpenAI
+
+    out = AnthropicToOpenAI.messages(
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "tu9",
+                            "content": [
+                                {"type": "text", "text": "shot"},
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/png",
+                                        "data": "aGVsbG8=",
+                                    },
+                                },
+                            ],
+                        }
+                    ],
+                }
+            ]
+        },
+        text_only=True,
+    )
+    blob = json.dumps(out)
+    assert "data:image/png;base64,aGVsbG8=" in blob
+    assert "[tool_result: shot]" in blob
+
+
+def test_openai_judge_honors_openai_api_base(tmp_path, monkeypatch):
+    """openai/* without an explicit base_url must follow OPENAI_API_BASE
+    (the stub / local proxy env) instead of hard-coding api.openai.com."""
+    from turbo_agent.verifier import Verifier
+
+    monkeypatch.setenv("OPENAI_API_BASE", "http://127.0.0.1:9/v1")
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    p = tmp_path / "j.yaml"
+    p.write_text("""
+backend:
+  models:
+    - name: openai/dummy
+      api_key: x
+verifier:
+  model: {name: openai/dummy, api_key: k}
+  method: {name: pivot_tournament, pivots: 1, n_verifications: 1}
+""")
+    v = Verifier(Config(str(p)).verifier_config)
+    assert "127.0.0.1:9" in str(v.client.base_url)
+    assert "api.openai.com" not in str(v.client.base_url)

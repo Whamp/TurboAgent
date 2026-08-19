@@ -178,8 +178,12 @@ class Config:
             if not self.models:
                 return None
             first = self.models[0]
-            raw_model = {"name": first.get("name"),
-                         "api_key": first.get("api_key")}
+            raw_model = {
+                "name": first.get("name"),
+                "api_key": first.get("api_key"),
+                "base_url": first.get("base_url"),
+                "provider": first.get("provider"),
+            }
         raw_api_key = raw_model.get("api_key", "")
         raw_base_url = raw_model.get("base_url", "")
         model_cfg = ModelConfig(

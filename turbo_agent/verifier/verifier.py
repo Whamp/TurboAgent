@@ -126,7 +126,14 @@ class Verifier:
             if base_url is None and name.startswith("openrouter/"):
                 base_url = "https://openrouter.ai/api/v1"
             elif base_url is None and name.startswith("openai/"):
-                base_url = "https://api.openai.com/v1"
+                # Official SDK env first, then the litellm/stub alias, then
+                # hosted OpenAI. Hard-coding api.openai.com first would send
+                # openai/dummy judges off-box.
+                base_url = (
+                    os.environ.get("OPENAI_BASE_URL")
+                    or os.environ.get("OPENAI_API_BASE")
+                    or "https://api.openai.com/v1"
+                )
             self._client = create_openai_client(base_url=base_url,
                                                 api_key=api_key)
         return self._client
