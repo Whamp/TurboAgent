@@ -29,7 +29,7 @@ REPO = Path(__file__).resolve().parent.parent
 LLAMA_LOCAL_YAML = """
 backend:
   models:
-    - name: openai/qwen3-1.7b
+    - name: openai/g9v3-3b
       api_key: sk-local
       base_url: http://127.0.0.1:8097/v1
       num_candidates: {candidates}
@@ -46,7 +46,7 @@ backend:
 {verifier}"""
 
 MAJORITY_VERIFIER = """verifier:
-  model: {name: openai/qwen3-1.7b, api_key: sk-local, base_url: 'http://127.0.0.1:8097/v1'}
+  model: {name: openai/g9v3-3b, api_key: sk-local, base_url: 'http://127.0.0.1:8097/v1'}
   majority_voting: true
   method: {name: pivot_tournament, pivots: 1, n_verifications: 1, seed: 0}"""
 
