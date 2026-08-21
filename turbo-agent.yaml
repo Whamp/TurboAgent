@@ -2,41 +2,45 @@ log_dir: default  # request logs go to .turbo-agent/<log_dir>/
 
 backend:
   models:
-    - name: gemini/gemini-2.5-flash
-      api_key: $VERTEX_API_KEY
-      num_candidates: 3        # parallel candidate responses per model
-      temperature: 1
-      thinking: high           # none, low, medium, high, or a token budget
+    - name: openai-codex/gpt-5.6-luna
+      executor: pi              # run through the Pi companion; your existing
+                                # Pi login (auth.json) supplies credentials
+      num_candidates: 4         # parallel candidate responses per request
+      thinking: xhigh
       max_tokens: 65536
 
-verifier:
-  model:
-    name: gemini/gemini-2.5-flash
-    api_key: $VERTEX_API_KEY
-    provider: vertex_ai      # set + use $VERTEX_API_KEY if logprobs need Vertex
-
-  majority_voting: true        # skip the tournament when a majority of candidates agree
-
-  method:
-    name: pivot_tournament
-    pivots: 2                  # k: number of pivot (empirical-leader) candidates
-    n_verifications: 1         # K: repeated verifications per directed pair
-    seed: 0                    # seed for the random ring pass (reproducible)
-    note: >-                   # no ground truth is available at inference time
-      There is no reference solution available. Judge each trajectory purely on
-      how plausibly it solved the task correctly.
-    criteria:
-      - name: Task Success
-        description: >-
-          How likely the agent correctly and completely solved the task. The
-          strongest signal is the agent verifying its solution against the
-          task's specific requirements. Trajectory length, number of steps, and
-          apparent confidence do not predict correctness.
+# Verifier selection is optional. When enabled, the judge must be an
+# OpenAI-compatible endpoint exposing token logprobs (Gemini via Vertex,
+# DeepSeek, OpenRouter, or any local vLLM/SGLang/llama.cpp server).
+# Majority voting skips the tournament when a strict majority of
+# candidates are identical.
+#
+# verifier:
+#   model:
+#     name: openai/<judge-model>
+#     api_key: $OPENAI_API_KEY
+#     # base_url: http://127.0.0.1:8097/v1   # for a local judge
+#   majority_voting: true
+#   method:
+#     name: pivot_tournament
+#     pivots: 2                  # k: number of pivot (empirical-leader) candidates
+#     n_verifications: 1         # K: repeated verifications per directed pair
+#     seed: 0                    # seed for the random ring pass (reproducible)
+#     note: >-
+#       There is no reference solution available. Judge each trajectory purely on
+#       how plausibly it solved the task correctly.
+#     criteria:
+#       - name: Task Success
+#         description: >-
+#           How likely the agent correctly and completely solved the task. The
+#           strongest signal is the agent verifying its solution against the
+#           task's specific requirements. Trajectory length, number of steps,
+#           and apparent confidence do not predict correctness.
 
 # context:                    # optional: rewrite/augment the prompt for clarity
 #   refinement_model:
-#     name: gemini/gemini-2.5-flash
-#     api_key: $VERTEX_API_KEY
+#     name: openai/<model>
+#     api_key: $OPENAI_API_KEY
 #   refinement_prompt: >-
 #     Your goal is to construct clearer context for another LLM to solve the
 #     problem. Read the context below thoroughly and produce a more specific,
@@ -46,10 +50,8 @@ verifier:
 
 #     The constructed context is:
 
-progress_monitor:             # optional, post-hoc: scores the selected trajectory
-  model:                      # with llm_verifier.track. Runs AFTER the response
-    name: gemini/gemini-2.5-flash   # is selected; it never changes it.
-    api_key: $VERTEX_API_KEY        # Surfaced in the visualizer.
-    provider: vertex_ai
-
-  n_verifications: 1          # K: repeated verifications (averaged)
+# progress_monitor:           # optional, post-hoc: scores the selected trajectory
+#   model:                    # after the response is selected; never changes it
+#     name: openai/<model>
+#     api_key: $OPENAI_API_KEY
+#   n_verifications: 1        # K: repeated verifications (averaged)

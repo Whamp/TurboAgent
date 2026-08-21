@@ -21,6 +21,7 @@
 // standard auth path.
 
 import { createRequire } from "node:module";
+import { execFileSync } from "node:child_process";
 import readline from "node:readline";
 import { pathToFileURL } from "node:url";
 import path from "node:path";
@@ -39,15 +40,37 @@ async function loadRuntime() {
     const mod = await import(pathToFileURL(path.resolve(setupPath)).href);
     return mod.createRuntime();
   }
-  const modulePath = process.env.TURBO_PI_MODULE_PATH;
-  let pi;
-  if (modulePath) {
-    pi = require_(modulePath);
-  } else {
-    pi = require_("@earendil-works/pi-coding-agent");
-  }
+  const pi = requirePiPackage();
   log("creating Pi ModelRuntime with standard auth path");
   return pi.ModelRuntime.create({ refreshOnCreate: true });
+}
+
+function requirePiPackage() {
+  const moduleName = "@earendil-works/pi-coding-agent";
+  const modulePath = process.env.TURBO_PI_MODULE_PATH;
+  if (modulePath) {
+    return require_(modulePath);
+  }
+  try {
+    return require_(moduleName);
+  } catch (localErr) {
+    // Not resolvable from this cwd (the usual case when Turbo runs from an
+    // arbitrary directory). Fall back to the user's global npm root, which
+    // is where a global `pi` install lives.
+    try {
+      const globalRoot = execFileSync("npm", ["root", "-g"], {
+        encoding: "utf8",
+      }).trim();
+      return require_(path.join(globalRoot, moduleName));
+    } catch (globalErr) {
+      throw new Error(
+        `Cannot load ${moduleName}. Install it globally (npm i -g), or set ` +
+        `TURBO_PI_MODULE_PATH to its dist/index.js. ` +
+        `Tried plain resolution (${localErr.message.split("\n")[0]}) and ` +
+        `the global npm root (${globalErr.message.split("\n")[0]}).`,
+      );
+    }
+  }
 }
 
 // OpenAI-shaped prompt -> Pi Context. The Python side owns precedence and
