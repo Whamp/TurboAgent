@@ -4,8 +4,9 @@ See docs/design/model-execution.md and docs/adr/0001-model-execution-seam.md.
 """
 
 from .errors import FailureKind, ModelExecutionError
-from .factory import ExecutionTargets, build_candidate_execution
+from .factory import ExecutionTargets, RoutingExecutor, build_candidate_execution
 from .litellm_adapter import LiteLLMExecutor
+from .pi_adapter import PiCompanionExecutor
 from .types import (
     AssistantOutput,
     ExecutionCompleted,
@@ -38,6 +39,8 @@ __all__ = [
     "ModelExecutionResult",
     "ModelExecutor",
     "ModelTarget",
+    "PiCompanionExecutor",
+    "RoutingExecutor",
     "TargetSpec",
     "TextDelta",
     "ThinkingDelta",

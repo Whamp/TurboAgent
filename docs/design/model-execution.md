@@ -261,17 +261,19 @@ The companion:
 - writes protocol messages to stdout and diagnostics to stderr;
 - never returns credentials to Python.
 
-Minimum wire messages:
+Minimum wire messages (`request` carries OpenAI-shaped messages/tools; the companion maps them to Pi's `Context`):
 
 ```json
-{"v":1,"id":"req-1","op":"complete","provider":"openai-codex","model":"<pi-model-id>","context":{},"options":{}}
-{"v":1,"id":"req-1","op":"stream","provider":"openai-codex","model":"<pi-model-id>","context":{},"options":{}}
+{"v":1,"id":"req-1","op":"complete","provider":"openai-codex","model":"<pi-model-id>","request":{"messages":[]},"options":{}}
+{"v":1,"id":"req-1","op":"stream","provider":"openai-codex","model":"<pi-model-id>","request":{"messages":[]},"options":{}}
 {"v":1,"id":"req-1","op":"cancel"}
 
 {"v":1,"id":"req-1","event":"delta","delta":{}}
 {"v":1,"id":"req-1","event":"done","result":{}}
 {"v":1,"id":"req-1","event":"error","error":{"kind":"rate_limited","retryable":true}}
 ```
+
+A model entry opts into this adapter with `executor: pi`; entries without it run through LiteLLM. The factory composes one adapter per kind and routes by target.
 
 The companion maps the prepared prompt to Pi's `Context` and `SimpleStreamOptions`. It maps Pi `AssistantMessage` content and events back to the canonical result and event types. A companion crash fails all in-flight calls as `unavailable`; the adapter may restart it for a later call but never silently replay an in-flight request.
 
@@ -283,7 +285,7 @@ Startup performs these steps:
 2. Allocate a stable opaque target id for each configured entry.
 3. Build the Candidate target list from `num_candidates`.
 4. Construct only the adapters required by configured targets.
-5. Start and validate the Pi companion when at least one Pi target exists.
+5. Start the Pi companion lazily on the first Pi-target call; a crash fails its in-flight calls as retryable `unavailable` and the next call restarts it.
 6. Inject the composed `ModelExecutor` into `Backend`.
 7. Call `aclose` from the FastAPI lifespan hook.
 
