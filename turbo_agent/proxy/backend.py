@@ -1,18 +1,29 @@
 import asyncio
-import copy
 import json
 import time
 import uuid
-from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
+from dataclasses import replace as dataclass_replace
+from typing import AsyncIterator, Dict, List, Optional, Tuple
 
+from ..model_execution import (
+    ExecutionCompleted,
+    GenerationIntent,
+    ModelExecutionRequest,
+    ModelExecutionResult,
+    ModelExecutor,
+    ModelTarget,
+    TextDelta,
+    ThinkingIntent,
+    ToolCallArgumentsDelta,
+    ToolCallStarted,
+    build_candidate_execution,
+)
 from ..utils import (
-    Config,
     AnthropicToOpenAI,
+    Config,
     OpenAIToAnthropic,
     STOP_REASON_MAP,
     SSEFormatter,
-    llm_completion,
-    llm_stream_completion,
     create_logger,
     create_request_log,
     save_request_log,
@@ -23,14 +34,113 @@ from ..verifier import Verifier
 
 logger = create_logger("backend")
 
+# Canonical finish reasons -> OpenAI wire values.
+_FINISH_TO_OPENAI = {
+    "stop": "stop",
+    "length": "length",
+    "tool_use": "tool_calls",
+    "content_filter": "content_filter",
+    "other": "stop",
+}
+
+# Canonical finish reasons -> Anthropic stop reasons.
+_FINISH_TO_ANTHROPIC = {
+    "stop": "end_turn",
+    "length": "max_tokens",
+    "tool_use": "tool_use",
+    "content_filter": "end_turn",
+    "other": "end_turn",
+}
+
+
+def _generation_intent(fields: dict) -> GenerationIntent:
+    """Build the client's explicit generation intent from request fields.
+
+    Only fields the client actually sent appear here; configured target
+    defaults are applied inside model execution, and the target's output cap
+    clamps last.
+    """
+    kwargs: dict = {}
+    if fields.get("max_completion_tokens") is not None:
+        kwargs["max_output_tokens"] = fields["max_completion_tokens"]
+        kwargs["max_output_tokens_field"] = "max_completion_tokens"
+    elif fields.get("max_tokens") is not None:
+        kwargs["max_output_tokens"] = fields["max_tokens"]
+    for key in (
+        "temperature", "top_p", "stop", "tool_choice", "response_format",
+        "seed", "presence_penalty", "frequency_penalty", "logit_bias",
+        "stream_options",
+    ):
+        if key in fields:
+            kwargs[key] = fields[key]
+    thinking = fields.get("thinking")
+    if isinstance(thinking, ThinkingIntent):
+        kwargs["thinking"] = thinking
+    elif fields.get("reasoning_effort") is not None:
+        kwargs["thinking"] = ThinkingIntent(
+            mode="adaptive", effort=fields["reasoning_effort"],
+        )
+    elif fields.get("thinking_budget") is not None:
+        kwargs["thinking"] = ThinkingIntent(
+            mode="budget", budget_tokens=int(fields["thinking_budget"]),
+        )
+    return GenerationIntent(**kwargs)
+
+
+def _result_to_response_dict(result: ModelExecutionResult) -> dict:
+    """Render a canonical result as an OpenAI-shaped response dict for the
+    downstream pipeline (verification, request trace, SSE replay)."""
+    message: dict = {"role": "assistant"}
+    message["content"] = result.output.text or None
+    if result.output.tool_calls:
+        message["tool_calls"] = [
+            {
+                "id": call.id,
+                "type": "function",
+                "function": {
+                    "name": call.name,
+                    "arguments": json.dumps(call.arguments),
+                },
+            }
+            for call in result.output.tool_calls
+        ]
+    response: dict = {
+        "id": result.response_id or f"chatcmpl-{uuid.uuid4().hex[:24]}",
+        "object": "chat.completion",
+        "created": 0,
+        "model": result.target.name,
+        "choices": [
+            {
+                "index": 0,
+                "message": message,
+                "finish_reason": _FINISH_TO_OPENAI[
+                    result.output.finish_reason
+                ],
+            }
+        ],
+    }
+    if result.usage:
+        response["usage"] = {
+            "prompt_tokens": result.usage.input_tokens,
+            "completion_tokens": result.usage.output_tokens,
+            "total_tokens": (
+                result.usage.input_tokens + result.usage.output_tokens
+            ),
+        }
+    return response
+
 
 class Backend:
     """Request pipeline: (optional) context refinement -> concurrent inference
     -> pivot-tournament verification -> best response."""
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, executor: Optional[ModelExecutor] = None):
         self.config = config
-        self._setup_env()
+
+        execution = build_candidate_execution(config)
+        if executor is not None:
+            execution = dataclass_replace(execution, executor=executor)
+        self._execution = execution
 
         self.refiner: Optional[ContextRefiner] = None
         self.verifier: Optional[Verifier] = None
@@ -54,63 +164,14 @@ class Backend:
             self.progress_monitor = ProgressMonitor(pm_cfg)
             logger.info(f"Progress monitor enabled (model={pm_cfg.model.name})")
 
-    def _setup_env(self) -> None:
-        import os
-
-        for model in self.config.models:
-            api_key = model.get("api_key", "")
-            if not api_key:
-                continue
-            if model.get("name", "").startswith("gemini/"):
-                os.environ["GEMINI_API_KEY"] = api_key
-
     @property
     def model_name(self) -> str:
-        return self.config.default_model["name"]
-
-    @property
-    def api_key(self) -> str:
-        return self.config.default_model.get("api_key", "")
+        """Display name of the default backend model (startup log line)."""
+        return self._execution.default_target.name
 
     # ------------------------------------------------------------------
     # Shared helpers
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def _parse_model_params(model: dict) -> dict:
-        params: dict = {}
-        if model.get("temperature") is not None:
-            params["temperature"] = model["temperature"]
-        if model.get("max_tokens") is not None:
-            params["max_tokens"] = model["max_tokens"]
-        thinking = model.get("thinking")
-        if thinking is not None:
-            if isinstance(thinking, (int, float)):
-                params["thinking_budget"] = int(thinking)
-            elif isinstance(thinking, str):
-                params["reasoning_effort"] = thinking
-        return params
-
-    def _base_params(self) -> dict:
-        return {
-            "model": self.model_name,
-            "api_key": self.api_key,
-            **self._parse_model_params(self.config.default_model),
-        }
-
-    def _model_entries(self) -> List[dict]:
-        """One entry per candidate to generate (num_candidates per model)."""
-        entries: List[dict] = []
-        for model in self.config.models:
-            num = model.get("num_candidates", 1)
-            entry = {
-                "name": model["name"],
-                "api_key": model.get("api_key", ""),
-                **self._parse_model_params(model),
-            }
-            for _ in range(num):
-                entries.append(entry)
-        return entries
 
     def _sanitized_config(self) -> dict:
         raw = dict(self.config.raw_config)
@@ -142,57 +203,37 @@ class Backend:
         return raw
 
     async def _refine_messages(
-        self, params: dict, req_log: Optional[dict] = None,
-    ) -> dict:
+        self, request: ModelExecutionRequest, req_log: Optional[dict] = None,
+    ) -> ModelExecutionRequest:
         if self.refiner:
-            original_messages = params["messages"]
-            refined = await self.refiner.refine(params["messages"])
+            original_messages = list(request.messages)
+            refined = await self.refiner.refine(original_messages)
             if req_log:
                 req_log["contextRefinement"] = {
                     "enabled": True,
                     "originalMessages": original_messages,
                     "refinedMessages": refined,
                 }
-            return {**params, "messages": refined}
-        return params
+            return dataclass_replace(request, messages=tuple(refined))
+        return request
 
     async def _gather_completions(
-        self, params_base: dict,
+        self, request: ModelExecutionRequest,
     ) -> List[Tuple[dict, str]]:
-        entries = self._model_entries()
+        executor = self._execution.executor
 
-        async def call_model(entry: dict) -> Tuple[dict, str]:
-            name = entry["name"]
-            api_key = entry.get("api_key", "")
-            model_params = {
-                k: v for k, v in entry.items() if k not in ("name", "api_key")
-            }
-            p = {**params_base, "model": name, "api_key": api_key, **model_params}
-            p.pop("stream", None)
-            # The YAML overlay must not undo the request's clamped caps or
-            # thinking settings: re-assert only keys the client actually
-            # sent, drop overlay keys the client replaced, then re-clamp
-            # against THIS entry's cap.
-            p.update(self._client_intent(params_base))
-            self._drop_overlay_keys_client_replaced(p, params_base)
-            self._apply_token_limits(p, cap=model_params.get("max_tokens"))
-            # Isolate nested payloads so a mutating provider cannot leak
-            # into the next candidate (shared messages list).
-            if "messages" in p:
-                p["messages"] = copy.deepcopy(p["messages"])
-            if "tools" in p:
-                p["tools"] = copy.deepcopy(p["tools"])
-            resp = await llm_completion(**self._public_llm_params(p))
-            return resp, name
+        async def run(target: ModelTarget) -> Tuple[dict, str]:
+            result = await executor.complete(target, request)
+            return _result_to_response_dict(result), target.name
 
-        tasks = [call_model(entry) for entry in entries]
+        tasks = [run(target) for target in self._execution.candidate_targets]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         successes: List[Tuple[dict, str]] = []
         errors: List[Exception] = []
         for r in results:
             if isinstance(r, Exception):
-                logger.error(f"CONCURRENT REQUEST FAILED: {type(r).__name__}: {r}")
+                logger.error(f"CONCURRENT REQUEST FAILED: {r}")
                 errors.append(r)
             else:
                 successes.append(r)
@@ -200,7 +241,7 @@ class Backend:
         if not successes:
             raise RuntimeError(
                 f"All {len(errors)} concurrent requests failed. "
-                f"First error: {type(errors[0]).__name__}: {errors[0]}"
+                f"First error: {errors[0]}"
             ) from errors[0]
         return successes
 
@@ -364,133 +405,40 @@ class Backend:
                 )
         return "\n".join(parts) if parts else "(empty response)"
 
-    # Stashed on params by the request builders; stripped before litellm.
-    _CLIENT_SUPPLIED_KEYS = "_client_supplied_keys"
-    _CLIENT_SENT_THINKING = "_client_sent_thinking"
-
-    def _client_intent(self, params_base: dict) -> dict:
-        """Values the client actually sent, re-asserted after the per-candidate
-        YAML overlay. YAML defaults (temperature, unused token field) stay
-        with the overlay so per-model config is not flattened to model[0]."""
-        keys = params_base.get(self._CLIENT_SUPPLIED_KEYS, ())
-        return {k: params_base[k] for k in keys if k in params_base}
-
-    @classmethod
-    def _drop_overlay_keys_client_replaced(
-        cls, params: dict, params_base: dict,
-    ) -> None:
-        """Remove YAML overlay keys the client replaced with a sibling field.
-
-        The overlay reintroduces per-model max_tokens / thinking. If the client
-        sent only max_completion_tokens (Pi) or only a thinking effort, those
-        YAML siblings must not stay on the wire.
-        """
-        sent = set(params_base.get(cls._CLIENT_SUPPLIED_KEYS, ()))
-        if "max_completion_tokens" in sent and "max_tokens" not in sent:
-            params.pop("max_tokens", None)
-        if "max_tokens" in sent and "max_completion_tokens" not in sent:
-            params.pop("max_completion_tokens", None)
-        # A client thinking object replaces YAML thinking wholesale, including
-        # type=disabled (no effort/budget keys) and budget-only vs effort-only.
-        if params_base.get(cls._CLIENT_SENT_THINKING):
-            if "reasoning_effort" not in sent:
-                params.pop("reasoning_effort", None)
-            if "thinking_budget" not in sent:
-                params.pop("thinking_budget", None)
-        elif "reasoning_effort" in sent and "thinking_budget" not in sent:
-            params.pop("thinking_budget", None)
-        elif "thinking_budget" in sent and "reasoning_effort" not in sent:
-            params.pop("reasoning_effort", None)
-
-    @classmethod
-    def _public_llm_params(cls, params: dict) -> dict:
-        """Drop internal bookkeeping keys before calling litellm."""
-        skip = {cls._CLIENT_SUPPLIED_KEYS, cls._CLIENT_SENT_THINKING}
-        return {k: v for k, v in params.items() if k not in skip}
-
-    @classmethod
-    def _record_client_keys(cls, params: dict, keys: list) -> None:
-        params[cls._CLIENT_SUPPLIED_KEYS] = tuple(k for k in keys if k in params)
-
-    def _apply_token_limits(self, params: dict, cap: int | None = None) -> None:
-        """Clamp client-provided token caps to the backend cap. Drop a
-        thinking budget that cannot fit strictly below max_tokens.
-
-        Only keys already present are touched: the client's field (max_tokens
-        on the Anthropic path, max_completion_tokens on the OpenAI path) stays
-        the only one on the wire, so a backend that maps either key (Gemini's
-        max_output_tokens) never sees a second, larger value win. ``cap`` is
-        the per-candidate YAML max_tokens when set, else the default model's.
-        """
-        if cap is None:
-            cap = self.config.default_model.get("max_tokens")
-        for key in ("max_tokens", "max_completion_tokens"):
-            if key not in params:
-                continue
-            val = int(params[key])
-            params[key] = val if cap is None else min(val, int(cap))
-
-        budget = params.get("thinking_budget")
-        output_cap = params.get("max_tokens")
-        if output_cap is None:
-            output_cap = params.get("max_completion_tokens")
-        if budget is not None and output_cap is not None:
-            mt = int(output_cap)
-            b = int(budget)
-            # Anthropic requires budget_tokens < max_tokens. If YAML thinking
-            # (or a client budget) cannot fit under the request's output cap,
-            # drop thinking rather than shrinking the cap Pi already set.
-            if b >= mt:
-                params.pop("thinking_budget", None)
-
     # ------------------------------------------------------------------
     # Anthropic-format API
     # ------------------------------------------------------------------
 
     def _build_anthropic_params(
         self, anthropic_body: dict,
-    ) -> Tuple[dict, str]:
-        """Build backend params from an Anthropic-format request.
+    ) -> Tuple[ModelExecutionRequest, str]:
+        """Build a ModelExecutionRequest from an Anthropic-format request.
 
-        Returns (params, requested_model). The requested model id is echoed
-        back to the client in responses; the actual backend model comes from
-        the config.
+        Returns (request, requested_model). The requested model id is echoed
+        back to the client in responses; target selection happens inside
+        model execution.
         """
-        requested_model = anthropic_body.get("model", self.model_name)
-        params: dict = {
-            **self._base_params(),
-            "messages": AnthropicToOpenAI.messages(anthropic_body),
-        }
-        client_keys: list = []
-
+        requested_model = anthropic_body.get(
+            "model", self._execution.default_target.name,
+        )
+        fields: dict = {}
         for key in ("max_tokens", "temperature", "top_p"):
             if key in anthropic_body:
-                params[key] = anthropic_body[key]
-                client_keys.append(key)
-
+                fields[key] = anthropic_body[key]
         if anthropic_body.get("stop_sequences"):
-            params["stop"] = anthropic_body["stop_sequences"]
-            client_keys.append("stop")
-        if "stream" in anthropic_body:
-            params["stream"] = anthropic_body["stream"]
-        if anthropic_body.get("tools"):
-            params["tools"] = AnthropicToOpenAI.tools(anthropic_body["tools"])
+            fields["stop"] = anthropic_body["stop_sequences"]
         if anthropic_body.get("tool_choice"):
-            params["tool_choice"] = AnthropicToOpenAI.tool_choice(
+            fields["tool_choice"] = AnthropicToOpenAI.tool_choice(
                 anthropic_body["tool_choice"]
             )
-            client_keys.append("tool_choice")
 
-        # Honor the client's thinking request when present; the config's
-        # thinking settings remain the default for requests that omit it.
-        # Client thinking replaces the config's thinking settings wholesale:
-        # a budget request must not leave a YAML reasoning_effort in force,
-        # and vice versa.
+        # Honor the client's thinking request when present; configured target
+        # thinking remains the default for requests that omit it. Client
+        # thinking replaces the config's thinking settings wholesale: a budget
+        # request must not leave a YAML reasoning_effort in force, and vice
+        # versa.
         thinking = anthropic_body.get("thinking")
         if isinstance(thinking, dict):
-            params.pop("reasoning_effort", None)
-            params.pop("thinking_budget", None)
-            params[self._CLIENT_SENT_THINKING] = True
             # Pi adaptive thinking puts effort on output_config, not
             # thinking.effort. Honor either, plus a top-level effort field.
             output_config = anthropic_body.get("output_config")
@@ -499,17 +447,27 @@ class Backend:
                 effort = output_config.get("effort")
             if not effort:
                 effort = anthropic_body.get("effort")
-            if thinking.get("type") == "adaptive" or effort:
-                params["reasoning_effort"] = effort or "high"
-                client_keys.append("reasoning_effort")
-            budget = thinking.get("budget_tokens")
-            if budget:
-                params["thinking_budget"] = int(budget)
-                client_keys.append("thinking_budget")
+            if effort or thinking.get("type") == "adaptive":
+                fields["thinking"] = ThinkingIntent(
+                    mode="adaptive", effort=effort or "high",
+                )
+            elif thinking.get("budget_tokens"):
+                fields["thinking"] = ThinkingIntent(
+                    mode="budget", budget_tokens=int(thinking["budget_tokens"]),
+                )
+            else:
+                fields["thinking"] = ThinkingIntent(mode="disabled")
 
-        self._apply_token_limits(params)
-        self._record_client_keys(params, client_keys)
-        return params, requested_model
+        tools = (
+            AnthropicToOpenAI.tools(anthropic_body["tools"])
+            if anthropic_body.get("tools") else []
+        )
+        request = ModelExecutionRequest(
+            messages=tuple(AnthropicToOpenAI.messages(anthropic_body)),
+            tools=tuple(tools),
+            generation=_generation_intent(fields),
+        )
+        return request, requested_model
 
     async def complete_anthropic(
         self, body: bytes | str,
@@ -525,35 +483,36 @@ class Backend:
         req_log = create_request_log("anthropic", self._sanitized_config())
         req_log["request"] = anthropic_body
 
-        params, requested_model = self._build_anthropic_params(anthropic_body)
-        params = await self._refine_messages(params, req_log)
-        params.pop("stream", None)
+        request, requested_model = self._build_anthropic_params(anthropic_body)
+        request = await self._refine_messages(request, req_log)
 
         if self.verifier:
             logger.info(
                 f"BACKEND sending {self.config.total_candidates} "
                 f"concurrent requests (anthropic)"
             )
-            responses = await self._gather_completions(params)
+            responses = await self._gather_completions(request)
             req_log["responses"] = [
                 {"model": m, "response": r} for r, m in responses
             ]
             response, model_name = await self._pick_best(
-                responses, params["messages"], req_log,
+                responses, list(request.messages), req_log,
             )
             final_result = OpenAIToAnthropic.response(response, requested_model)
         else:
-            logger.info(f"BACKEND calling {self.model_name} (anthropic)")
-            response = await llm_completion(**self._public_llm_params(params))
+            target = self._execution.default_target
+            logger.info(f"BACKEND calling {target.name} (anthropic)")
+            result = await self._execution.executor.complete(target, request)
+            response = _result_to_response_dict(result)
             req_log["responses"] = [
-                {"model": self.model_name, "response": response}
+                {"model": target.name, "response": response}
             ]
             final_result = OpenAIToAnthropic.response(response, requested_model)
 
         req_log["finalResponse"] = final_result
         req_log["elapsedMs"] = (time.monotonic() - start) * 1000
         save_request_log(req_log, self.config.log_dir)
-        self._spawn_progress(params["messages"], response, req_log)
+        self._spawn_progress(list(request.messages), response, req_log)
         return final_result, None
 
     async def stream_anthropic(
@@ -568,8 +527,8 @@ class Backend:
         )
         req_log["request"] = anthropic_body
 
-        params, requested_model = self._build_anthropic_params(anthropic_body)
-        params = await self._refine_messages(params, req_log)
+        request, requested_model = self._build_anthropic_params(anthropic_body)
+        request = await self._refine_messages(request, req_log)
 
         # When the verifier is active, collect all responses, verify, replay.
         if self.verifier:
@@ -577,102 +536,79 @@ class Backend:
                 f"BACKEND sending {self.config.total_candidates} concurrent "
                 f"requests for verification (anthropic stream)"
             )
-            responses = await self._gather_completions(params)
+            responses = await self._gather_completions(request)
             req_log["responses"] = [
                 {"model": m, "response": r} for r, m in responses
             ]
             best_resp, best_model = await self._pick_best(
-                responses, params["messages"], req_log,
+                responses, list(request.messages), req_log,
             )
             req_log["finalResponse"] = best_resp
             req_log["elapsedMs"] = (time.monotonic() - start) * 1000
             save_request_log(req_log, self.config.log_dir)
-            self._spawn_progress(params["messages"], best_resp, req_log)
+            self._spawn_progress(list(request.messages), best_resp, req_log)
             async for event in self._replay_anthropic_sse(
                 best_resp, requested_model,
             ):
                 yield event
             return
 
-        params["stream"] = True
-        logger.info(f"BACKEND streaming {self.model_name} (anthropic)")
+        logger.info(
+            f"BACKEND streaming {self._execution.default_target.name} (anthropic)"
+        )
 
         msg_id = f"msg_{uuid.uuid4().hex[:24]}"
         yield SSEFormatter.message_start(requested_model, msg_id)
 
-        stream = await llm_stream_completion(**self._public_llm_params(params))
-
         block_index = 0
         text_block_open = False
-        tool_blocks: Dict[str, dict] = {}
-        current_tool_id: Optional[str] = None
+        tool_blocks: dict[str, dict] = {}
         output_tokens = 0
 
-        async for chunk in stream:
-            chunk_dict = (
-                chunk.model_dump() if hasattr(chunk, "model_dump") else chunk
-            )
-            choices = chunk_dict.get("choices", [])
-            if not choices:
-                continue
-            choice = choices[0]
-            delta = choice.get("delta", {})
-
-            usage = chunk_dict.get("usage")
-            if usage and usage.get("completion_tokens"):
-                output_tokens = usage["completion_tokens"]
-
-            if delta.get("content"):
+        async for event in self._execution.executor.stream(
+            self._execution.default_target, request,
+        ):
+            if isinstance(event, TextDelta):
                 if not text_block_open:
                     yield SSEFormatter.content_block_start(block_index, "text")
                     text_block_open = True
-                yield SSEFormatter.text_delta(block_index, delta["content"])
-
-            if delta.get("tool_calls"):
-                for tc_delta in delta["tool_calls"]:
-                    tc_id = tc_delta.get("id")
-
-                    if tc_id and tc_id not in tool_blocks:
-                        if text_block_open:
-                            yield SSEFormatter.content_block_stop(block_index)
-                            block_index += 1
-                            text_block_open = False
-
-                        tool_blocks[tc_id] = {
-                            "index": block_index,
-                            "name": tc_delta.get("function", {}).get("name", ""),
-                        }
-                        current_tool_id = tc_id
-
-                        yield SSEFormatter.content_block_start(
-                            block_index,
-                            "tool_use",
-                            tool_id=tc_id,
-                            tool_name=tool_blocks[tc_id]["name"],
-                        )
-
-                    target_id = tc_id or current_tool_id
-                    if target_id and target_id in tool_blocks:
-                        func = tc_delta.get("function", {})
-                        if func.get("arguments"):
-                            yield SSEFormatter.input_json_delta(
-                                tool_blocks[target_id]["index"],
-                                func["arguments"],
-                            )
-
-            if choice.get("finish_reason"):
+                yield SSEFormatter.text_delta(block_index, event.text)
+            elif isinstance(event, ToolCallStarted):
                 if text_block_open:
                     yield SSEFormatter.content_block_stop(block_index)
                     block_index += 1
                     text_block_open = False
 
+                tool_blocks[event.id] = {
+                    "index": block_index,
+                    "name": event.name,
+                }
+                yield SSEFormatter.content_block_start(
+                    block_index,
+                    "tool_use",
+                    tool_id=event.id,
+                    tool_name=event.name,
+                )
+            elif isinstance(event, ToolCallArgumentsDelta):
+                target_block = tool_blocks.get(event.id)
+                if target_block and event.json_fragment:
+                    yield SSEFormatter.input_json_delta(
+                        target_block["index"],
+                        event.json_fragment,
+                    )
+            elif isinstance(event, ExecutionCompleted):
+                if text_block_open:
+                    yield SSEFormatter.content_block_stop(block_index)
+                    text_block_open = False
+
                 for tinfo in tool_blocks.values():
                     yield SSEFormatter.content_block_stop(tinfo["index"])
-                    block_index += 1
 
-                stop_reason = STOP_REASON_MAP.get(
-                    choice["finish_reason"], "end_turn"
-                )
+                if event.result.usage:
+                    output_tokens = event.result.usage.output_tokens
+                stop_reason = _FINISH_TO_ANTHROPIC[
+                    event.result.output.finish_reason
+                ]
                 yield SSEFormatter.message_delta(stop_reason, output_tokens)
                 yield SSEFormatter.message_stop()
 
@@ -718,52 +654,37 @@ class Backend:
     # OpenAI-format API
     # ------------------------------------------------------------------
 
-    def _build_openai_params(self, openai_body: dict) -> Tuple[dict, str]:
-        requested_model = openai_body.get("model", self.model_name)
-        params: dict = {
-            **self._base_params(),
-            "messages": openai_body.get("messages", []),
-        }
-        client_keys: list = []
+    def _build_openai_params(self, openai_body: dict) -> Tuple[ModelExecutionRequest, str]:
+        requested_model = openai_body.get(
+            "model", self._execution.default_target.name,
+        )
+        fields: dict = {}
 
         direct_keys = [
-            "temperature", "top_p", "stop", "tools", "tool_choice",
-            "response_format", "seed", "n", "presence_penalty",
-            "frequency_penalty", "logit_bias", "reasoning_effort",
+            "temperature", "top_p", "stop", "tool_choice",
+            "response_format", "seed", "presence_penalty",
+            "frequency_penalty", "logit_bias", "stream_options",
         ]
         for key in direct_keys:
             if key in openai_body:
-                params[key] = openai_body[key]
-                if key in (
-                    "temperature", "top_p", "stop", "tool_choice",
-                    "reasoning_effort",
-                ):
-                    client_keys.append(key)
+                fields[key] = openai_body[key]
 
-        client_sent_max_tokens = bool(openai_body.get("max_tokens"))
-        client_sent_mct = bool(openai_body.get("max_completion_tokens"))
-        if client_sent_max_tokens:
-            params["max_tokens"] = openai_body["max_tokens"]
-            client_keys.append("max_tokens")
-        if client_sent_mct:
-            params["max_completion_tokens"] = openai_body["max_completion_tokens"]
-            client_keys.append("max_completion_tokens")
-            # Pi sends only max_completion_tokens. Drop the YAML max_tokens
-            # planted by _base_params so a max_tokens-preferring backend
-            # cannot ignore the client cap.
-            if not client_sent_max_tokens:
-                params.pop("max_tokens", None)
-        if "stream" in openai_body:
-            params["stream"] = openai_body["stream"]
-        if openai_body.get("stream_options"):
-            params["stream_options"] = openai_body["stream_options"]
+        # Pi sends only max_completion_tokens. The client's token field
+        # choice must survive to the wire so a backend that maps only one
+        # key cannot ignore the client cap.
+        if openai_body.get("max_completion_tokens"):
+            fields["max_completion_tokens"] = openai_body["max_completion_tokens"]
+        elif openai_body.get("max_tokens"):
+            fields["max_tokens"] = openai_body["max_tokens"]
         if openai_body.get("reasoning_effort"):
-            # client effort replaces any budget-based YAML thinking
-            params.pop("thinking_budget", None)
+            fields["reasoning_effort"] = openai_body["reasoning_effort"]
 
-        self._apply_token_limits(params)
-        self._record_client_keys(params, client_keys)
-        return params, requested_model
+        request = ModelExecutionRequest(
+            messages=tuple(openai_body.get("messages", [])),
+            tools=tuple(openai_body.get("tools") or []),
+            generation=_generation_intent(fields),
+        )
+        return request, requested_model
 
     async def complete_openai(
         self, body: bytes | str,
@@ -779,28 +700,29 @@ class Backend:
         req_log = create_request_log("openai", self._sanitized_config())
         req_log["request"] = openai_body
 
-        params, requested_model = self._build_openai_params(openai_body)
-        params.pop("stream", None)
-        params = await self._refine_messages(params, req_log)
+        request, requested_model = self._build_openai_params(openai_body)
+        request = await self._refine_messages(request, req_log)
 
         if self.verifier:
             logger.info(
                 f"BACKEND sending {self.config.total_candidates} "
                 f"concurrent requests (openai)"
             )
-            responses = await self._gather_completions(params)
+            responses = await self._gather_completions(request)
             req_log["responses"] = [
                 {"model": m, "response": r} for r, m in responses
             ]
             response, _ = await self._pick_best(
-                responses, params["messages"], req_log,
+                responses, list(request.messages), req_log,
             )
             final_result = response
         else:
-            logger.info(f"BACKEND calling {self.model_name} (openai)")
-            final_result = await llm_completion(**self._public_llm_params(params))
+            target = self._execution.default_target
+            logger.info(f"BACKEND calling {target.name} (openai)")
+            result = await self._execution.executor.complete(target, request)
+            final_result = _result_to_response_dict(result)
             req_log["responses"] = [
-                {"model": self.model_name, "response": final_result}
+                {"model": target.name, "response": final_result}
             ]
 
         # Echo the model the client asked for; the backend model stays in the
@@ -810,7 +732,7 @@ class Backend:
         req_log["finalResponse"] = final_result
         req_log["elapsedMs"] = (time.monotonic() - start) * 1000
         save_request_log(req_log, self.config.log_dir)
-        self._spawn_progress(params["messages"], final_result, req_log)
+        self._spawn_progress(list(request.messages), final_result, req_log)
         return final_result, None
 
     async def stream_openai(
@@ -823,39 +745,97 @@ class Backend:
         req_log = create_request_log("openai_stream", self._sanitized_config())
         req_log["request"] = openai_body
 
-        params, requested_model = self._build_openai_params(openai_body)
-        params = await self._refine_messages(params, req_log)
+        request, requested_model = self._build_openai_params(openai_body)
+        request = await self._refine_messages(request, req_log)
 
         if self.verifier:
             logger.info(
                 f"BACKEND sending {self.config.total_candidates} concurrent "
                 f"requests for verification (openai stream)"
             )
-            responses = await self._gather_completions(params)
+            responses = await self._gather_completions(request)
             req_log["responses"] = [
                 {"model": m, "response": r} for r, m in responses
             ]
             best_resp, _ = await self._pick_best(
-                responses, params["messages"], req_log,
+                responses, list(request.messages), req_log,
             )
             req_log["finalResponse"] = best_resp
             req_log["elapsedMs"] = (time.monotonic() - start) * 1000
             save_request_log(req_log, self.config.log_dir)
-            self._spawn_progress(params["messages"], best_resp, req_log)
+            self._spawn_progress(list(request.messages), best_resp, req_log)
             async for event in self._replay_openai_sse(best_resp, requested_model):
                 yield event
             return
 
-        params["stream"] = True
-        logger.info(f"BACKEND streaming {self.model_name} (openai)")
+        logger.info(
+            f"BACKEND streaming {self._execution.default_target.name} (openai)"
+        )
 
-        stream = await llm_stream_completion(**self._public_llm_params(params))
-        async for chunk in stream:
-            chunk_dict = (
-                chunk.model_dump() if hasattr(chunk, "model_dump") else chunk
-            )
-            chunk_dict["model"] = requested_model
-            yield f"data: {json.dumps(chunk_dict, default=str)}\n\n"
+        chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+        first_delta = True
+        tool_indexes: Dict[str, int] = {}
+        next_tool_index = 0
+
+        async for event in self._execution.executor.stream(
+            self._execution.default_target, request,
+        ):
+            delta: dict = {}
+            if isinstance(event, TextDelta):
+                delta["content"] = event.text
+                if first_delta:
+                    delta["role"] = "assistant"
+            elif isinstance(event, ToolCallStarted):
+                tool_indexes[event.id] = next_tool_index
+                next_tool_index += 1
+                delta["tool_calls"] = [
+                    {
+                        "index": tool_indexes[event.id],
+                        "id": event.id,
+                        "type": "function",
+                        "function": {"name": event.name, "arguments": ""},
+                    }
+                ]
+            elif isinstance(event, ToolCallArgumentsDelta):
+                delta["tool_calls"] = [
+                    {
+                        "index": tool_indexes.get(event.id, 0),
+                        "function": {"arguments": event.json_fragment},
+                    }
+                ]
+            elif isinstance(event, ExecutionCompleted):
+                result = event.result
+                chunk: dict = {
+                    "id": result.response_id or chunk_id,
+                    "object": "chat.completion.chunk",
+                    "created": 0,
+                    "model": requested_model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": _FINISH_TO_OPENAI[
+                                result.output.finish_reason
+                            ],
+                        }
+                    ],
+                }
+                if result.usage:
+                    chunk["usage"] = {
+                        "prompt_tokens": result.usage.input_tokens,
+                        "completion_tokens": result.usage.output_tokens,
+                        "total_tokens": (
+                            result.usage.input_tokens
+                            + result.usage.output_tokens
+                        ),
+                    }
+                yield f"data: {json.dumps(chunk, default=str)}\n\n"
+                continue
+            else:
+                continue
+
+            first_delta = False
+            yield f"data: {json.dumps({'id': chunk_id, 'object': 'chat.completion.chunk', 'created': 0, 'model': requested_model, 'choices': [{'index': 0, 'delta': delta, 'finish_reason': None}]}, default=str)}\n\n"
 
         yield "data: [DONE]\n\n"
 

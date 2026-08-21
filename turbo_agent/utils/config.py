@@ -169,7 +169,7 @@ class Config:
     @property
     def verifier_config(self) -> Optional[VerifierConfig]:
         raw_v = self._raw.get("verifier")
-        if not raw_v:
+        if not raw_v or raw_v.get("enabled") is False:
             return None
 
         raw_model = raw_v.get("model") or {}
