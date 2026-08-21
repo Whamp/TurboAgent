@@ -33,3 +33,6 @@ include = ["turbo_agent*"]
 
 [tool.setuptools.package-data]
 turbo_agent = ["visualizer-dist/**/*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

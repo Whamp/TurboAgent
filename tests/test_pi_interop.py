@@ -384,7 +384,6 @@ def test_candidates_keep_client_limits_and_effort(tmp_path, monkeypatch):
     client's clamped max_tokens or its reasoning effort."""
     import asyncio
 
-    import turbo_agent.proxy.backend as bmod
 
     backend = _make_backend(tmp_path, """
 log_dir: test_logs
@@ -420,7 +419,7 @@ verifier:
                       "total_tokens": 2},
         }
 
-    monkeypatch.setattr(bmod, "llm_completion", fake)
+    backend._execution.executor._complete_fn = fake
     asyncio.run(backend.complete_anthropic(json.dumps({
         "model": "claude-x",
         "max_tokens": 32000,
@@ -444,8 +443,10 @@ backend:
       max_tokens: 65536
       thinking: 2048
 """)
-    params, _ = backend._build_anthropic_params(
+    request, _ = backend._build_anthropic_params(
         {"model": "m", "max_tokens": 32000, "messages": []})
+    params = backend._execution.executor._build_params(
+        backend._execution.default_target, request)
     assert params["max_tokens"] == 32000
     assert "max_completion_tokens" not in params  # one field on the wire
 
@@ -458,9 +459,11 @@ backend:
       max_tokens: 65536
       thinking: 2048
 """)
-    p, _ = tiny._build_anthropic_params(
+    tiny_request, _ = tiny._build_anthropic_params(
         {"model": "m", "max_tokens": 200, "messages": []})
-    assert "thinking_budget" not in p
+    tiny_params = tiny._execution.executor._build_params(
+        tiny._execution.default_target, tiny_request)
+    assert "thinking" not in tiny_params
 
 
 def test_verifier_judge_is_configurable(tmp_path, monkeypatch):
@@ -599,7 +602,6 @@ def test_openai_client_mct_does_not_keep_yaml_max_tokens(tmp_path, monkeypatch):
     the client cap)."""
     import asyncio
 
-    import turbo_agent.proxy.backend as bmod
 
     backend = _make_backend(tmp_path, """
 backend:
@@ -623,7 +625,7 @@ verifier:
         })
         return dict(_CANNED_OK)
 
-    monkeypatch.setattr(bmod, "llm_completion", fake)
+    backend._execution.executor._complete_fn = fake
     asyncio.run(backend.complete_openai(json.dumps({
         "model": "pi-label",
         "max_completion_tokens": 100,
@@ -642,7 +644,6 @@ def test_per_model_temperature_survives_when_client_omits_it(tmp_path, monkeypat
     temperature. Re-asserting default-model sampling flattened both."""
     import asyncio
 
-    import turbo_agent.proxy.backend as bmod
 
     backend = _make_backend(tmp_path, """
 backend:
@@ -668,7 +669,7 @@ verifier:
         seen.append((kw.get("model"), kw.get("temperature"), kw.get("max_tokens")))
         return dict(_CANNED_OK)
 
-    monkeypatch.setattr(bmod, "llm_completion", fake)
+    backend._execution.executor._complete_fn = fake
     asyncio.run(backend.complete_anthropic(json.dumps({
         "model": "m",
         "max_tokens": 500,
@@ -684,7 +685,6 @@ def test_candidate_messages_are_not_shared(tmp_path, monkeypatch):
     cannot append into the next candidate's payload."""
     import asyncio
 
-    import turbo_agent.proxy.backend as bmod
 
     backend = _make_backend(tmp_path, """
 backend:
@@ -706,7 +706,7 @@ verifier:
         msgs.append({"role": "assistant", "content": "mutated"})
         return dict(_CANNED_OK)
 
-    monkeypatch.setattr(bmod, "llm_completion", fake)
+    backend._execution.executor._complete_fn = fake
     asyncio.run(backend.complete_anthropic(json.dumps({
         "model": "m",
         "max_tokens": 50,
@@ -782,7 +782,6 @@ def test_client_budget_clears_yaml_reasoning_effort(tmp_path, monkeypatch):
     on the verifier gather path."""
     import asyncio
 
-    import turbo_agent.proxy.backend as bmod
 
     backend = _make_backend(tmp_path, """
 backend:
@@ -803,14 +802,17 @@ verifier:
         seen.append((kw.get("reasoning_effort"), kw.get("thinking_budget")))
         return dict(_CANNED_OK)
 
-    monkeypatch.setattr(bmod, "llm_completion", fake)
+    backend._execution.executor._complete_fn = fake
     asyncio.run(backend.complete_anthropic(json.dumps({
         "model": "claude-x",
         "max_tokens": 32000,
         "thinking": {"type": "enabled", "budget_tokens": 4096},
         "messages": [{"role": "user", "content": "hi"}],
     })))
-    assert seen == [(None, 4096)] * 3
+    # The client budget must clear the YAML effort. On this openai/* target
+    # a token budget has no wire representation, so neither key appears;
+    # budget translation itself is covered by the model execution tests.
+    assert seen == [(None, None)] * 3
 
 
 def test_pi_adaptive_reads_output_config_effort(tmp_path):
@@ -823,13 +825,15 @@ backend:
       max_tokens: 65536
       thinking: high
 """)
-    params, _ = backend._build_anthropic_params({
+    request, _ = backend._build_anthropic_params({
         "model": "claude-opus-4-6",
         "max_tokens": 32000,
         "thinking": {"type": "adaptive", "display": "summarized"},
         "output_config": {"effort": "low"},
         "messages": [],
     })
+    params = backend._execution.executor._build_params(
+        backend._execution.default_target, request)
     assert params.get("reasoning_effort") == "low"
     assert "thinking_budget" not in params
 
@@ -837,7 +841,6 @@ backend:
 def test_thinking_disabled_clears_yaml_thinking(tmp_path, monkeypatch):
     import asyncio
 
-    import turbo_agent.proxy.backend as bmod
 
     backend = _make_backend(tmp_path, """
 backend:
@@ -858,7 +861,7 @@ verifier:
         seen.append((kw.get("reasoning_effort"), kw.get("thinking_budget")))
         return dict(_CANNED_OK)
 
-    monkeypatch.setattr(bmod, "llm_completion", fake)
+    backend._execution.executor._complete_fn = fake
     asyncio.run(backend.complete_anthropic(json.dumps({
         "model": "m",
         "max_tokens": 2048,
@@ -890,24 +893,29 @@ verifier:
 
 def test_thinking_dropped_when_budget_does_not_fit_cap(tmp_path):
     """YAML thinking that cannot fit under the client's max_tokens is dropped,
-    not rewritten to steal output tokens."""
+    not rewritten to steal output tokens. Uses an anthropic/* target because
+    that is where a token budget has a wire representation."""
     backend = _make_backend(tmp_path, """
 backend:
   models:
-    - name: openai/dummy
+    - name: anthropic/dummy
       api_key: x
       max_tokens: 65536
       thinking: 2048
 """)
-    tied, _ = backend._build_anthropic_params({
+    tied_request, _ = backend._build_anthropic_params({
         "model": "m", "max_tokens": 2048, "messages": [],
     })
-    assert "thinking_budget" not in tied
+    tied = backend._execution.executor._build_params(
+        backend._execution.default_target, tied_request)
+    assert "thinking" not in tied
 
-    fits, _ = backend._build_anthropic_params({
+    fits_request, _ = backend._build_anthropic_params({
         "model": "m", "max_tokens": 4096, "messages": [],
     })
-    assert fits.get("thinking_budget") == 2048
+    fits = backend._execution.executor._build_params(
+        backend._execution.default_target, fits_request)
+    assert fits.get("thinking") == {"type": "enabled", "budget_tokens": 2048}
 
 
 def test_count_tokens_counts_images(proxy):
