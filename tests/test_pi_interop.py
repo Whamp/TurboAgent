@@ -531,6 +531,39 @@ verifier:
     p2.write_text("backend:\n  models:\n    - name: openai/dummy\n      api_key: x\n")
     assert Config(str(p2)).verifier_config is None
 
+
+def test_verifier_enabled_false_disables(tmp_path):
+    """verifier.enabled: false disables verification even though the section
+    is present; the judge fallback must not resurrect it."""
+    p = tmp_path / "turbo-agent.yaml"
+    p.write_text("""
+backend:
+  models:
+    - name: openai/dummy
+      api_key: x
+      num_candidates: 3
+
+verifier:
+  enabled: false
+""")
+    assert Config(str(p)).verifier_config is None
+
+    p2 = tmp_path / "explicit-on.yaml"
+    p2.write_text("""
+backend:
+  models:
+    - name: openai/dummy
+      api_key: x
+      num_candidates: 3
+
+verifier:
+  enabled: true
+  majority_voting: true
+""")
+    vc = Config(str(p2)).verifier_config
+    assert vc is not None
+    assert vc.model.name == "openai/dummy"
+
     # fallback copies base_url and provider from the backend model (local
     # vLLM / Vertex) so the judge hits the same server the candidates do.
     p3 = tmp_path / "local-backend.yaml"
