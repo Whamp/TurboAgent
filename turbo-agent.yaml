@@ -12,8 +12,18 @@ backend:
 # Verifier selection is optional. When enabled, the judge must be an
 # OpenAI-compatible endpoint exposing token logprobs (Gemini via Vertex,
 # DeepSeek, OpenRouter, or any local vLLM/SGLang/llama.cpp server).
-# Majority voting skips the tournament when a strict majority of
-# candidates are identical.
+# Majority voting skips the tournament when a strict majority of candidates
+# agree:
+#
+#   majority.mode: exact      raw string equality (default)
+#   majority.mode: normalized case/punctuation/whitespace-insensitive
+#   majority.mode: semantic   tool calls must still match exactly; prose may
+#                             agree via embedding cosine >= threshold.
+#                             Measured on octen-embed (4B, endurance):
+#                             true paraphrases 0.84-0.93, near-miss bash
+#                             commands 0.86-0.94 — which is why tool calls
+#                             are never relaxed. Embedding failures degrade
+#                             to normalized comparison.
 #
 # verifier:
 #   model:
@@ -21,6 +31,12 @@ backend:
 #     api_key: $OPENAI_API_KEY
 #     # base_url: http://127.0.0.1:8097/v1   # for a local judge
 #   majority_voting: true
+#   majority:
+#     mode: semantic
+#     threshold: 0.92
+#     embedding:
+#       base_url: http://endurance:8090/v1
+#       model: octen-embed
 #   method:
 #     name: pivot_tournament
 #     pivots: 2                  # k: number of pivot (empirical-leader) candidates

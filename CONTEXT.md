@@ -29,7 +29,7 @@ Selection of one candidate as the response. That includes the majority-vote shor
 The LLM that scores directed pairs during the pivot tournament.
 
 **Majority voting**:
-A verification shortcut: if more than half the candidates are identical, the tournament does not run and that completion wins.
+A verification shortcut: if more than half the candidates agree, the tournament does not run and that completion wins. Agreement modes: `exact` (raw string equality), `normalized` (case/punctuation/whitespace-insensitive), or `semantic` — tool calls must still match exactly; prose may agree via embedding cosine similarity. Semantic agreement is a speed/risk tradeoff, not proof of equivalence.
 
 **Pivot tournament**:
 The comparison procedure verification uses when majority voting does not apply. The judge scores directed pairs. The winner is the selected candidate.
