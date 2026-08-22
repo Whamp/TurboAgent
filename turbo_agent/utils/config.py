@@ -32,10 +32,28 @@ class PivotTournamentConfig:
 
 
 @dataclass
+class MajorityConfig:
+    """How the majority-voting shortcut decides that candidates agree.
+
+    exact      — raw string equality (historical behavior).
+    normalized — equality after lowercasing, collapsing whitespace, and
+                 stripping punctuation.
+    semantic   — tool calls must match exactly (whitespace-collapsed); prose
+                 may agree via cosine similarity at or above ``threshold``
+                 from an OpenAI-compatible embedding endpoint. Embedding
+                 failures degrade to the normalized comparison.
+    """
+    mode: str = "exact"
+    threshold: float = 0.92
+    embedding: ModelConfig | None = None
+
+
+@dataclass
 class VerifierConfig:
     model: ModelConfig
     method: PivotTournamentConfig
     majority_voting: bool = False
+    majority: MajorityConfig = field(default_factory=MajorityConfig)
 
 
 @dataclass
@@ -218,10 +236,41 @@ class Config:
             criteria=criteria,
         )
 
+        raw_majority = raw_v.get("majority", {}) or {}
+        majority_cfg = self._majority_config(raw_majority)
+
         return VerifierConfig(
             model=model_cfg,
             method=method_cfg,
             majority_voting=raw_v.get("majority_voting", False),
+            majority=majority_cfg,
+        )
+
+    def _majority_config(self, raw: dict) -> MajorityConfig:
+        mode = raw.get("mode", "exact")
+        if mode not in ("exact", "normalized", "semantic"):
+            raise ValueError(
+                f"Unknown verifier majority mode '{mode}'. "
+                f"Expected exact, normalized, or semantic."
+            )
+        embedding = None
+        if mode == "semantic":
+            raw_embed = raw.get("embedding") or {}
+            if not raw_embed.get("base_url") or not raw_embed.get("model"):
+                raise ValueError(
+                    "verifier.majority.mode 'semantic' requires an "
+                    "embedding endpoint (base_url and model)."
+                )
+            api_key = raw_embed.get("api_key") or None
+            embedding = ModelConfig(
+                name=raw_embed["model"],
+                base_url=raw_embed["base_url"],
+                api_key=self._resolve_env(api_key) if api_key else None,
+            )
+        return MajorityConfig(
+            mode=mode,
+            threshold=float(raw.get("threshold", 0.92)),
+            embedding=embedding,
         )
 
     # ------------------------------------------------------------------

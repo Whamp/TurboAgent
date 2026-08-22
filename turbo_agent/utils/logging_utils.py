@@ -26,6 +26,8 @@ class Logger:
             flush=True,
         )
 
+    warning = warn  # standard logging name; warn kept for existing callers
+
     def error(self, msg: str) -> None:
         print(
             f"\033[2m[{_timestamp()}]\033[0m \033[31m{self.name}\033[0m {msg}",

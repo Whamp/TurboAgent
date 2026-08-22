@@ -14,8 +14,10 @@ visualizer displays.
 import asyncio
 import json
 import os
+import re
 import tempfile
-from typing import List, Optional
+from collections.abc import Callable
+from typing import List
 
 import llm_verifier
 from llm_verifier.fine_grained_reward import (
@@ -29,6 +31,36 @@ from llm_verifier.prompts import normalize_criteria
 from ..utils import VerifierConfig, create_logger
 
 _logger = create_logger("verifier")
+
+# Matches the "[tool_call: name(args)]" lines Backend.format_action emits.
+_TOOL_CALL_LINE = re.compile(r"^\[tool_call: (\S+)\((.*)\)\]$")
+
+
+def split_action(action: str):
+    """Split a formatted action into (prose, tool_calls).
+
+    ``tool_calls`` preserves order; entries are the raw "name(args)" text.
+    Lines that are not tool-call markers are prose.
+    """
+    prose, tools = [], []
+    for line in action.splitlines():
+        m = _TOOL_CALL_LINE.match(line.strip())
+        if m:
+            tools.append(f"{m.group(1)}({m.group(2)})")
+        elif line.strip():
+            prose.append(line.strip())
+    return "\n".join(prose), tools
+
+
+def _normalize_prose(text: str) -> str:
+    lowered = re.sub(r"[^a-z0-9\s]", "", text.lower())
+    return re.sub(r"\s+", " ", lowered).strip()
+
+
+def _normalize_tool_calls(tools: List[str]) -> tuple:
+    # Whitespace only. Case and punctuation are significant in commands;
+    # `rm -rf /build` must never equal `rm -rf /tmp/build`.
+    return tuple(re.sub(r"\s+", " ", t).strip() for t in tools)
 
 
 class Comparison:
@@ -83,10 +115,13 @@ class Verifier:
              for c in self.method.criteria]
         )
         self._client = self._UNSET  # created lazily on first scoring call
+        # Injectable for tests; built from config on first use otherwise.
+        self._embed_fn: Callable | None = None
         _logger.info(
             f"Verifier: model={cfg.model.name}, method=pivot_tournament, "
             f"pivots={self.method.pivots}, K={self.method.n_verifications}, "
-            f"criteria={[c['name'] for c in self.criteria]}"
+            f"criteria={[c['name'] for c in self.criteria]}, "
+            f"majority_mode={cfg.majority.mode}"
         )
 
     @staticmethod
@@ -152,7 +187,7 @@ class Verifier:
     # ------------------------------------------------------------------
 
     async def select_best(
-        self, history: str, actions: List[str],
+        self, history: str, actions: list[str],
     ) -> SelectionResult:
         n = len(actions)
         if n == 0:
@@ -160,6 +195,8 @@ class Verifier:
         if n == 1:
             return SelectionResult(0, [1.0], [])
 
+        if self.cfg.majority.mode == "semantic":
+            await asyncio.to_thread(self._ensure_embed_fn)
         majority = self._try_majority_voting(actions)
         if majority is not None:
             return majority
@@ -174,6 +211,22 @@ class Verifier:
             f"best={result.index}"
         )
         return SelectionResult(result.index, result.scores, comparisons)
+
+    def select_best_sync(self, actions: list[str]) -> SelectionResult:
+        """Synchronous selection over actions alone (no history). Exercises
+        the same agreement shortcut and tournament dispatch as the async
+        path."""
+        if not actions:
+            return SelectionResult(0, [], [])
+        if len(actions) == 1:
+            return SelectionResult(0, [1.0], [])
+        majority = self._try_majority_voting(actions)
+        if majority is not None:
+            return majority
+        result, pair_scores = self._run_select("", actions)
+        return SelectionResult(result.index, result.scores,
+                               self._build_comparisons("", actions,
+                                                       pair_scores))
 
     # ------------------------------------------------------------------
     # llm-verifier tournament
@@ -231,25 +284,94 @@ class Verifier:
     # Majority voting
     # ------------------------------------------------------------------
 
+    def _agreement_keys(self, actions: list[str]) -> list:
+        """Per-action grouping key under the configured mode."""
+        mode = self.cfg.majority.mode
+        if mode == "exact":
+            return list(actions)
+        split = [split_action(a) for a in actions]
+        norm_prose = [_normalize_prose(p) for p, _ in split]
+        tools = [_normalize_tool_calls(t) for _, t in split]
+        if mode == "normalized":
+            return [(t, p) for t, p in zip(tools, norm_prose)]
+        # semantic: tool calls stay exact-ish; prose groups by embedding.
+        unique = sorted({p for p, _ in split})
+        cluster_ids = dict(zip(unique, self._cluster_ids(unique)))
+        return [(tools[i], cluster_ids[split[i][0]]) for i in range(len(actions))]
+
+    def _cosine(self, a: list[float], b: list[float]) -> float:
+        num = sum(x * y for x, y in zip(a, b))
+        da = sum(x * x for x in a) ** 0.5
+        db = sum(y * y for y in b) ** 0.5
+        if da == 0 or db == 0:
+            return 0.0
+        return num / (da * db)
+
+    def _ensure_embed_fn(self) -> Callable:
+        if self._embed_fn is not None:
+            return self._embed_fn
+        embed_cfg = self.cfg.majority.embedding
+        from openai import OpenAI
+        client = OpenAI(base_url=embed_cfg.base_url,
+                        api_key=embed_cfg.api_key or "none")
+        model = embed_cfg.name
+
+        def embed(texts: list[str]) -> list[list[float]]:
+            response = client.embeddings.create(model=model, input=texts)
+            return [d.embedding for d in response.data]
+
+        self._embed_fn = embed
+        return embed
+
+    def _cluster_ids(self, texts: list[str]) -> list[int]:
+        """Cluster ids for texts: greedy join to the first representative at
+        or above the configured cosine threshold. Empty prose always groups
+        alone; an embedding-endpoint failure degrades to normalized equality
+        so selection never crashes."""
+        non_empty = [t for t in texts if t]
+        ids = {}
+        if non_empty:
+            try:
+                vectors = self._ensure_embed_fn()(non_empty)
+            except Exception as exc:  # noqa: BLE001 — degrade, never crash selection
+                _logger.warning(
+                    f"Embedding endpoint failed ({exc}); degrading majority "
+                    f"comparison to normalized"
+                )
+                return [hash(_normalize_prose(t)) for t in texts]
+            threshold = self.cfg.majority.threshold
+            reps: list[list[float]] = []
+            for text, vec in zip(non_empty, vectors):
+                for cid, rep in enumerate(reps):
+                    if self._cosine(vec, rep) >= threshold:
+                        ids[text] = cid
+                        break
+                else:
+                    reps.append(vec)
+                    ids[text] = len(reps) - 1
+        return [ids[t] if t else object() for t in texts]
+
     def _try_majority_voting(
         self, actions: List[str],
-    ) -> Optional[SelectionResult]:
+    ) -> SelectionResult | None:
         if not self.cfg.majority_voting:
             return None
+        keys = self._agreement_keys(actions)
         counts = {}
-        for action in actions:
-            counts[action] = counts.get(action, 0) + 1
-        majority_action, majority_count = "", 0
-        for action, count in counts.items():
+        for key in keys:
+            counts[key] = counts.get(key, 0) + 1
+        majority_key, majority_count = None, 0
+        for key, count in counts.items():
             if count > majority_count:
-                majority_count, majority_action = count, action
-        if majority_count <= len(actions) / 2:
+                majority_count, majority_key = count, key
+        if majority_key is None or majority_count <= len(actions) / 2:
             return None
 
+        best = next(i for i, k in enumerate(keys) if k == majority_key)
+        scores = [1.0 if k == majority_key else 0.0 for k in keys]
         _logger.info(
-            f"Majority voting: {majority_count}/{len(actions)} responses are "
-            f"identical, skipping tournament"
+            f"Majority voting ({self.cfg.majority.mode}): "
+            f"{majority_count}/{len(actions)} responses agree, "
+            f"skipping tournament"
         )
-        best = next(i for i, a in enumerate(actions) if a == majority_action)
-        scores = [1.0 if a == majority_action else 0.0 for a in actions]
         return SelectionResult(best, scores, [])
