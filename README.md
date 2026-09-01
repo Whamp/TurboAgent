@@ -130,6 +130,11 @@ Notes:
   exposes logprobs; OpenRouter degrades to parsing the judge's written score
   when the upstream provider does not). If `verifier.model` is omitted the
   judge defaults to the backend candidate model.
+- A named `endpoint` can cap candidate and judge traffic to one local server.
+  It defines the base URL, bounded FIFO queue, queue deadline, request
+  deadline, and maximum active calls. The opt-in `server60` judge adapter
+  uses x-high comparison generations and non-thinking one-token score probes.
+  See [Endpoint admission and server60 judging](docs/design/endpoint-admission.md).
 - Pi counts tokens locally; the proxy also answers `/v1/messages/count_tokens`
   with an approximate local count so token-counting clients never leak a
   request to api.anthropic.com.
@@ -137,8 +142,8 @@ Notes:
 ## Configuration
 
 Edit `turbo-agent.yaml`. API keys can reference environment variables with
-`$VAR_NAME` syntax. See the reference `turbo-agent.yaml` file for reference
-and usage.
+`$VAR_NAME` syntax. See the reference `turbo-agent.yaml` file and the
+[endpoint admission guide](docs/design/endpoint-admission.md).
 
 Config discovery works like pi's settings files — a project config, then a
 global default:

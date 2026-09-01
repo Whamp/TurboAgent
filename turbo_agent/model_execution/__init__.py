@@ -3,6 +3,7 @@
 See docs/design/model-execution.md and docs/adr/0001-model-execution-seam.md.
 """
 
+from .admission_executor import EndpointAdmissionExecutor
 from .errors import FailureKind, ModelExecutionError
 from .factory import ExecutionTargets, RoutingExecutor, build_candidate_execution
 from .litellm_adapter import LiteLLMExecutor
@@ -28,6 +29,7 @@ from .types import (
 
 __all__ = [
     "AssistantOutput",
+    "EndpointAdmissionExecutor",
     "ExecutionCompleted",
     "ExecutionTargets",
     "FailureKind",

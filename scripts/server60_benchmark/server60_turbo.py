@@ -32,11 +32,18 @@ def config_yaml(
 ) -> str:
     """Render one production-model Turbo benchmark configuration."""
     majority = "true" if majority_voting else "false"
-    return f"""backend:
+    return f"""endpoints:
+  server60:
+    base_url: {base_url}
+    max_concurrency: 4
+    max_queue_size: 64
+    queue_timeout_seconds: 600
+    request_timeout_seconds: 1800
+backend:
   models:
     - name: openai/{model}
       api_key: sk-local
-      base_url: {base_url}
+      endpoint: server60
       num_candidates: {candidates}
       temperature: 0.7
       thinking: xhigh
@@ -45,7 +52,11 @@ verifier:
   model:
     name: openai/{model}
     api_key: sk-local
-    base_url: {base_url}
+    endpoint: server60
+  execution:
+    adapter: server60
+    comparison_max_output_tokens: 16384
+    max_concurrency: 4
   majority_voting: {majority}
   majority:
     mode: semantic
@@ -89,27 +100,20 @@ class JudgeCallCounter:
         self.calls = 0
         self.completion_tokens = 0
         self.sum_call_s = 0.0
-        self._capacity = threading.Semaphore(4)
+        self._lock = threading.Lock()
         completions = verifier.client.chat.completions
         original = completions.create
 
         def counted_create(**kwargs):
-            extra_body = dict(kwargs.get("extra_body") or {})
-            is_score_probe = kwargs.get("max_tokens") == 1
-            extra_body["chat_template_kwargs"] = {
-                "enable_thinking": not is_score_probe,
-            }
-            kwargs["extra_body"] = extra_body
-            if not is_score_probe:
-                kwargs["reasoning_effort"] = "xhigh"
-                kwargs["max_tokens"] = 16384
             started = time.monotonic()
-            with self._capacity:
-                response = original(**kwargs)
-            self.sum_call_s += time.monotonic() - started
-            self.calls += 1
+            response = original(**kwargs)
+            elapsed = time.monotonic() - started
             usage = getattr(response, "usage", None)
-            self.completion_tokens += int(getattr(usage, "completion_tokens", 0) or 0)
+            completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+            with self._lock:
+                self.sum_call_s += elapsed
+                self.calls += 1
+                self.completion_tokens += completion_tokens
             return response
 
         completions.create = counted_create
@@ -117,18 +121,22 @@ class JudgeCallCounter:
 
 def _quality_mode_verifiers(backend: Backend) -> dict[str, Verifier]:
     semantic = backend.verifier
+    if semantic is None:
+        raise RuntimeError("Quality benchmark requires an enabled verifier")
     return {
         "exact": Verifier(
             replace(
                 semantic.cfg,
                 majority=replace(semantic.cfg.majority, mode="exact"),
-            )
+            ),
+            admission_registry=backend._endpoint_admission,
         ),
         "normalized": Verifier(
             replace(
                 semantic.cfg,
                 majority=replace(semantic.cfg.majority, mode="normalized"),
-            )
+            ),
+            admission_registry=backend._endpoint_admission,
         ),
         "semantic": semantic,
     }
@@ -288,7 +296,10 @@ async def run_turbo_selection_scale(
             )
         )
         backend = Backend(Config(str(path)))
-        judge_counter = JudgeCallCounter(backend.verifier) if candidates > 1 else None
+        verifier = backend.verifier
+        if candidates > 1 and verifier is None:
+            raise RuntimeError("Selection benchmark requires an enabled verifier")
+        judge_counter = JudgeCallCounter(verifier) if verifier is not None else None
         trials = []
         for _ in range(samples):
             body = {
@@ -315,12 +326,14 @@ async def run_turbo_selection_scale(
             judge_sum_call_s = 0.0
             selection_scores = []
             if candidates > 1:
+                if judge_counter is None or verifier is None:
+                    raise RuntimeError("Selection benchmark lost its verifier")
                 actions = [extract_response_text(r) for r, _, _ in responses]
                 calls_before = judge_counter.calls
                 tokens_before = judge_counter.completion_tokens
                 call_s_before = judge_counter.sum_call_s
                 started = time.monotonic()
-                selected = await backend.verifier.select_best(
+                selected = await verifier.select_best(
                     Backend.format_history(body["messages"]),
                     actions,
                 )

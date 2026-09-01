@@ -156,4 +156,6 @@ class TargetSpec:
     base_url: str | None = None
     temperature: float | None = None
     max_output_tokens: int | None = None
+    max_retries: int | None = None
+    request_timeout_seconds: float | None = None
     thinking: ThinkingIntent = field(default_factory=ThinkingIntent)

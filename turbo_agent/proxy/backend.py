@@ -2,6 +2,7 @@ import asyncio
 import json
 import time
 import uuid
+from contextlib import aclosing
 from dataclasses import replace as dataclass_replace
 from typing import AsyncIterator, Dict, List, Optional, Tuple
 
@@ -29,6 +30,10 @@ from ..utils import (
     save_request_log,
 )
 from ..context import ContextRefiner
+from ..endpoint_admission import (
+    EndpointAdmissionRegistry,
+    EndpointAdmissionSnapshot,
+)
 from ..progress_monitor import ProgressMonitor
 from ..verifier import Verifier
 
@@ -136,11 +141,17 @@ class Backend:
 
     def __init__(self, config: Config, executor: Optional[ModelExecutor] = None):
         self.config = config
-
-        execution = build_candidate_execution(config)
-        if executor is not None:
-            execution = dataclass_replace(execution, executor=executor)
-        self._execution = execution
+        self._endpoint_admission = EndpointAdmissionRegistry(
+            {
+                name: endpoint.policy
+                for name, endpoint in config.endpoint_configs.items()
+            }
+        )
+        self._execution = build_candidate_execution(
+            config,
+            executor=executor,
+            admission_registry=self._endpoint_admission,
+        )
 
         self.refiner: Optional[ContextRefiner] = None
         self.verifier: Optional[Verifier] = None
@@ -154,7 +165,10 @@ class Backend:
 
         ver_cfg = config.verifier_config
         if ver_cfg and config.total_candidates > 1:
-            self.verifier = Verifier(ver_cfg)
+            self.verifier = Verifier(
+                ver_cfg,
+                admission_registry=self._endpoint_admission,
+            )
             logger.info(
                 f"Verifier enabled (total_candidates={config.total_candidates})"
             )
@@ -168,6 +182,12 @@ class Backend:
     def model_name(self) -> str:
         """Display name of the default backend model (startup log line)."""
         return self._execution.default_target.name
+
+    def endpoint_admission_snapshot(
+        self, endpoint_name: str,
+    ) -> EndpointAdmissionSnapshot:
+        """Return active and queued counts for one configured endpoint."""
+        return self._endpoint_admission.snapshot(endpoint_name)
 
     # ------------------------------------------------------------------
     # Shared helpers
@@ -565,52 +585,55 @@ class Backend:
         tool_blocks: dict[str, dict] = {}
         output_tokens = 0
 
-        async for event in self._execution.executor.stream(
-            self._execution.default_target, request,
-        ):
-            if isinstance(event, TextDelta):
-                if not text_block_open:
-                    yield SSEFormatter.content_block_start(block_index, "text")
-                    text_block_open = True
-                yield SSEFormatter.text_delta(block_index, event.text)
-            elif isinstance(event, ToolCallStarted):
-                if text_block_open:
-                    yield SSEFormatter.content_block_stop(block_index)
-                    block_index += 1
-                    text_block_open = False
+        event_stream = self._execution.executor.stream(
+            self._execution.default_target,
+            request,
+        )
+        async with aclosing(event_stream):
+            async for event in event_stream:
+                if isinstance(event, TextDelta):
+                    if not text_block_open:
+                        yield SSEFormatter.content_block_start(block_index, "text")
+                        text_block_open = True
+                    yield SSEFormatter.text_delta(block_index, event.text)
+                elif isinstance(event, ToolCallStarted):
+                    if text_block_open:
+                        yield SSEFormatter.content_block_stop(block_index)
+                        block_index += 1
+                        text_block_open = False
 
-                tool_blocks[event.id] = {
-                    "index": block_index,
-                    "name": event.name,
-                }
-                yield SSEFormatter.content_block_start(
-                    block_index,
-                    "tool_use",
-                    tool_id=event.id,
-                    tool_name=event.name,
-                )
-            elif isinstance(event, ToolCallArgumentsDelta):
-                target_block = tool_blocks.get(event.id)
-                if target_block and event.json_fragment:
-                    yield SSEFormatter.input_json_delta(
-                        target_block["index"],
-                        event.json_fragment,
+                    tool_blocks[event.id] = {
+                        "index": block_index,
+                        "name": event.name,
+                    }
+                    yield SSEFormatter.content_block_start(
+                        block_index,
+                        "tool_use",
+                        tool_id=event.id,
+                        tool_name=event.name,
                     )
-            elif isinstance(event, ExecutionCompleted):
-                if text_block_open:
-                    yield SSEFormatter.content_block_stop(block_index)
-                    text_block_open = False
+                elif isinstance(event, ToolCallArgumentsDelta):
+                    target_block = tool_blocks.get(event.id)
+                    if target_block and event.json_fragment:
+                        yield SSEFormatter.input_json_delta(
+                            target_block["index"],
+                            event.json_fragment,
+                        )
+                elif isinstance(event, ExecutionCompleted):
+                    if text_block_open:
+                        yield SSEFormatter.content_block_stop(block_index)
+                        text_block_open = False
 
-                for tinfo in tool_blocks.values():
-                    yield SSEFormatter.content_block_stop(tinfo["index"])
+                    for tinfo in tool_blocks.values():
+                        yield SSEFormatter.content_block_stop(tinfo["index"])
 
-                if event.result.usage:
-                    output_tokens = event.result.usage.output_tokens
-                stop_reason = _FINISH_TO_ANTHROPIC[
-                    event.result.output.finish_reason
-                ]
-                yield SSEFormatter.message_delta(stop_reason, output_tokens)
-                yield SSEFormatter.message_stop()
+                    if event.result.usage:
+                        output_tokens = event.result.usage.output_tokens
+                    stop_reason = _FINISH_TO_ANTHROPIC[
+                        event.result.output.finish_reason
+                    ]
+                    yield SSEFormatter.message_delta(stop_reason, output_tokens)
+                    yield SSEFormatter.message_stop()
 
     async def _replay_anthropic_sse(
         self, response: dict, model_name: str,
@@ -777,65 +800,68 @@ class Backend:
         tool_indexes: Dict[str, int] = {}
         next_tool_index = 0
 
-        async for event in self._execution.executor.stream(
-            self._execution.default_target, request,
-        ):
-            delta: dict = {}
-            if isinstance(event, TextDelta):
-                delta["content"] = event.text
-                if first_delta:
-                    delta["role"] = "assistant"
-            elif isinstance(event, ToolCallStarted):
-                tool_indexes[event.id] = next_tool_index
-                next_tool_index += 1
-                delta["tool_calls"] = [
-                    {
-                        "index": tool_indexes[event.id],
-                        "id": event.id,
-                        "type": "function",
-                        "function": {"name": event.name, "arguments": ""},
-                    }
-                ]
-            elif isinstance(event, ToolCallArgumentsDelta):
-                delta["tool_calls"] = [
-                    {
-                        "index": tool_indexes.get(event.id, 0),
-                        "function": {"arguments": event.json_fragment},
-                    }
-                ]
-            elif isinstance(event, ExecutionCompleted):
-                result = event.result
-                chunk: dict = {
-                    "id": result.response_id or chunk_id,
-                    "object": "chat.completion.chunk",
-                    "created": 0,
-                    "model": requested_model,
-                    "choices": [
+        event_stream = self._execution.executor.stream(
+            self._execution.default_target,
+            request,
+        )
+        async with aclosing(event_stream):
+            async for event in event_stream:
+                delta: dict = {}
+                if isinstance(event, TextDelta):
+                    delta["content"] = event.text
+                    if first_delta:
+                        delta["role"] = "assistant"
+                elif isinstance(event, ToolCallStarted):
+                    tool_indexes[event.id] = next_tool_index
+                    next_tool_index += 1
+                    delta["tool_calls"] = [
                         {
-                            "index": 0,
-                            "delta": {},
-                            "finish_reason": _FINISH_TO_OPENAI[
-                                result.output.finish_reason
-                            ],
+                            "index": tool_indexes[event.id],
+                            "id": event.id,
+                            "type": "function",
+                            "function": {"name": event.name, "arguments": ""},
                         }
-                    ],
-                }
-                if result.usage:
-                    chunk["usage"] = {
-                        "prompt_tokens": result.usage.input_tokens,
-                        "completion_tokens": result.usage.output_tokens,
-                        "total_tokens": (
-                            result.usage.input_tokens
-                            + result.usage.output_tokens
-                        ),
+                    ]
+                elif isinstance(event, ToolCallArgumentsDelta):
+                    delta["tool_calls"] = [
+                        {
+                            "index": tool_indexes.get(event.id, 0),
+                            "function": {"arguments": event.json_fragment},
+                        }
+                    ]
+                elif isinstance(event, ExecutionCompleted):
+                    result = event.result
+                    chunk: dict = {
+                        "id": result.response_id or chunk_id,
+                        "object": "chat.completion.chunk",
+                        "created": 0,
+                        "model": requested_model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {},
+                                "finish_reason": _FINISH_TO_OPENAI[
+                                    result.output.finish_reason
+                                ],
+                            }
+                        ],
                     }
-                yield f"data: {json.dumps(chunk, default=str)}\n\n"
-                continue
-            else:
-                continue
+                    if result.usage:
+                        chunk["usage"] = {
+                            "prompt_tokens": result.usage.input_tokens,
+                            "completion_tokens": result.usage.output_tokens,
+                            "total_tokens": (
+                                result.usage.input_tokens
+                                + result.usage.output_tokens
+                            ),
+                        }
+                    yield f"data: {json.dumps(chunk, default=str)}\n\n"
+                    continue
+                else:
+                    continue
 
-            first_delta = False
-            yield f"data: {json.dumps({'id': chunk_id, 'object': 'chat.completion.chunk', 'created': 0, 'model': requested_model, 'choices': [{'index': 0, 'delta': delta, 'finish_reason': None}]}, default=str)}\n\n"
+                first_delta = False
+                yield f"data: {json.dumps({'id': chunk_id, 'object': 'chat.completion.chunk', 'created': 0, 'model': requested_model, 'choices': [{'index': 0, 'delta': delta, 'finish_reason': None}]}, default=str)}\n\n"
 
         yield "data: [DONE]\n\n"
 
