@@ -2,6 +2,8 @@
 
 ![Turbo Agent visualizer](screenshot.png)
 
+This is the Whamp fork of Turbo Agent. It adds native Pi and Codex execution, local-model routing, configurable verification, and shared endpoint admission. See [How this fork differs from upstream](FORK.md) for the full comparison, current limits, and upstream changes that still need reconciliation.
+
 Turbo Agent is the Claude Code plugin for LLM-as-a-Verifier. It implements an LLM API proxy that improves response quality through concurrent inference, verification, and refinement. It sits between your client (Claude Code, Codex, etc.) and the LLM provider, sending multiple parallel requests and selecting the best response with a **Probabilistic Pivot Tournament (PPT)** scored by a fine-grained logprob verifier.
 
 ```
