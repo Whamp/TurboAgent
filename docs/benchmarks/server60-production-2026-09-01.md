@@ -14,6 +14,20 @@ The product conclusions are narrower:
 4. **Add endpoint-aware admission control to Turbo.** server60 enforces four active sequences correctly, but an uncoordinated fifth request waited 43.5 seconds inside vLLM. Turbo should own queue policy, deadlines, and observability.
 5. **Do not default every x-high request to four candidates.** The quality corpus found no correctness uplift because every oracle-backed candidate was already correct. One hard four-candidate problem consumed 75,845 output tokens and took 24.8 minutes.
 
+## Implementation follow-up
+
+Turbo Agent now has the server60 Judge adapter and endpoint admission described in [ADR-0002](../adr/0002-endpoint-admission-and-server60-judge.md). The benchmark runner uses that production path and no longer patches judge requests or owns a separate semaphore.
+
+Fresh live checks against the same endpoint produced these results:
+
+- A forced Paris-versus-Berlin tournament selected Paris with scores `0.7281` and `0.2719`. The run took `20.7281` seconds, peaked at two active judge calls, and ended with zero active or waiting calls.
+- Four candidate streams occupied all four Turbo slots. A fifth stayed in Turbo's queue, so vLLM reported four running and zero waiting.
+- Canceling one stream closed its local task in `0.0002` seconds. The queued replacement emitted its first event `0.5069` seconds after cancellation.
+- Turbo and vLLM returned to zero active and zero waiting calls after cleanup.
+- After explicit provider-stream cleanup was added, a fresh early-close smoke received a `ThinkingDelta` with one active Turbo lease, closed the LiteLLM stream in `0.0023` seconds, and returned both Turbo and vLLM to zero active and zero waiting calls.
+
+The production configuration and failure rules are in [Endpoint admission and server60 judging](../design/endpoint-admission.md).
+
 ## Production system under test
 
 | Field | Value |

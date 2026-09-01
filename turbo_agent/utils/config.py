@@ -2,9 +2,12 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
 import yaml
 from dotenv import load_dotenv
+
+from ..endpoint_admission import EndpointAdmissionPolicy
 
 
 @dataclass
@@ -13,6 +16,25 @@ class ModelConfig:
     provider: Optional[str] = None
     api_key: Optional[str] = None
     base_url: Optional[str] = None
+    endpoint: str | None = None
+
+
+@dataclass(frozen=True)
+class EndpointConfig:
+    """Named endpoint URL and its shared admission policy."""
+
+    name: str
+    base_url: str
+    policy: EndpointAdmissionPolicy
+
+
+@dataclass(frozen=True)
+class JudgeExecutionConfig:
+    """Provider-specific execution rules for verifier judge calls."""
+
+    adapter: str = "default"
+    comparison_max_output_tokens: int = 4096
+    max_concurrency: int | None = None
 
 
 @dataclass
@@ -54,6 +76,7 @@ class VerifierConfig:
     method: PivotTournamentConfig
     majority_voting: bool = False
     majority: MajorityConfig = field(default_factory=MajorityConfig)
+    execution: JudgeExecutionConfig = field(default_factory=JudgeExecutionConfig)
 
 
 @dataclass
@@ -138,10 +161,92 @@ class Config:
 
     def _expand_env_vars(self) -> None:
         for model in self.models:
-            for field in ("api_key", "base_url"):
-                val = model.get(field, "")
+            for field_name in ("api_key", "base_url"):
+                val = model.get(field_name, "")
                 if isinstance(val, str) and val.startswith("$"):
-                    model[field] = self._resolve_env(val)
+                    model[field_name] = self._resolve_env(val)
+        for endpoint in (self._raw.get("endpoints") or {}).values():
+            base_url = endpoint.get("base_url", "")
+            if isinstance(base_url, str) and base_url.startswith("$"):
+                endpoint["base_url"] = self._resolve_env(base_url)
+
+    # ------------------------------------------------------------------
+    # Shared model endpoints
+    # ------------------------------------------------------------------
+
+    @property
+    def endpoint_configs(self) -> dict[str, EndpointConfig]:
+        """Parse named endpoint URLs and bounded admission policies."""
+        configs = {}
+        for name, raw in (self._raw.get("endpoints") or {}).items():
+            base_url = raw.get("base_url")
+            if not base_url:
+                raise ValueError(f"Endpoint '{name}' requires base_url")
+            scheme, host, _port = self.endpoint_origin(base_url)
+            if scheme not in ("http", "https") or not host:
+                raise ValueError(
+                    f"Endpoint '{name}' requires an absolute HTTP(S) base_url"
+                )
+            configs[name] = EndpointConfig(
+                name=name,
+                base_url=base_url,
+                policy=EndpointAdmissionPolicy(
+                    max_concurrency=int(raw.get("max_concurrency", 1)),
+                    max_queue_size=int(raw.get("max_queue_size", 64)),
+                    queue_timeout_seconds=float(
+                        raw.get("queue_timeout_seconds", 300)
+                    ),
+                    request_timeout_seconds=float(
+                        raw.get("request_timeout_seconds", 900)
+                    ),
+                ),
+            )
+        return configs
+
+    def model_base_url(self, model: dict[str, Any]) -> str | None:
+        """Resolve a model's direct or named endpoint URL without merging them."""
+        direct_url = model.get("base_url") or None
+        endpoint_name = model.get("endpoint") or None
+        if endpoint_name is None:
+            return direct_url
+        try:
+            endpoint = self.endpoint_configs[endpoint_name]
+        except KeyError:
+            raise ValueError(f"Unknown model endpoint '{endpoint_name}'") from None
+        if direct_url and direct_url.rstrip("/") != endpoint.base_url.rstrip("/"):
+            raise ValueError(
+                f"Model endpoint '{endpoint_name}' conflicts with its base_url"
+            )
+        return endpoint.base_url
+
+    @staticmethod
+    def endpoint_origin(base_url: str) -> tuple[str, str, int | None]:
+        """Identify the server capacity domain independent of API path."""
+        parsed = urlsplit(base_url)
+        default_port = 443 if parsed.scheme.lower() == "https" else 80
+        return (
+            parsed.scheme.lower(),
+            (parsed.hostname or "").lower(),
+            parsed.port or default_port,
+        )
+
+    @staticmethod
+    def provider_environment_base_url(model: dict[str, Any]) -> str | None:
+        """Resolve LiteLLM's provider-specific implicit API-base variables."""
+        if model.get("executor") == "pi":
+            return None
+        provider = str(model.get("name", "")).split("/", 1)[0]
+        if not provider:
+            return None
+        env_prefix = provider.replace("-", "_").upper()
+        keys = [f"{env_prefix}_API_BASE"]
+        if provider == "openai":
+            keys.insert(0, "OPENAI_BASE_URL")
+        for key in keys:
+            value = os.environ.get(key)
+            if value:
+                return value
+        return None
 
     # ------------------------------------------------------------------
     # Backend
@@ -202,14 +307,24 @@ class Config:
                 "api_key": first.get("api_key"),
                 "base_url": first.get("base_url"),
                 "provider": first.get("provider"),
+                "endpoint": first.get("endpoint"),
             }
+        model_name = raw_model.get("name")
+        if not isinstance(model_name, str) or not model_name:
+            raise ValueError("Verifier model name must be a non-empty string")
         raw_api_key = raw_model.get("api_key", "")
         raw_base_url = raw_model.get("base_url", "")
+        if raw_base_url:
+            raw_model = {
+                **raw_model,
+                "base_url": self._resolve_env(raw_base_url),
+            }
         model_cfg = ModelConfig(
-            name=raw_model["name"],
+            name=model_name,
             provider=raw_model.get("provider"),
             api_key=self._resolve_env(raw_api_key) if raw_api_key else None,
-            base_url=self._resolve_env(raw_base_url) if raw_base_url else None,
+            base_url=self.model_base_url(raw_model),
+            endpoint=raw_model.get("endpoint") or None,
         )
 
         raw_method = raw_v.get("method", {})
@@ -238,12 +353,82 @@ class Config:
 
         raw_majority = raw_v.get("majority", {}) or {}
         majority_cfg = self._majority_config(raw_majority)
+        execution_cfg = self._judge_execution_config(
+            raw_v.get("execution") or {}, model_cfg
+        )
 
         return VerifierConfig(
             model=model_cfg,
             method=method_cfg,
             majority_voting=raw_v.get("majority_voting", False),
             majority=majority_cfg,
+            execution=execution_cfg,
+        )
+
+    def _judge_execution_config(
+        self,
+        raw: dict[str, Any],
+        model: ModelConfig,
+    ) -> JudgeExecutionConfig:
+        adapter = raw.get("adapter", "default")
+        if adapter not in ("default", "server60"):
+            raise ValueError(
+                f"Unknown verifier execution adapter '{adapter}'. "
+                "Expected default or server60."
+            )
+        if adapter == "default":
+            if model.endpoint is not None:
+                raise ValueError(
+                    "verifier model.endpoint requires execution.adapter 'server60'"
+                )
+            if model.base_url is not None:
+                judge_origin = self.endpoint_origin(model.base_url)
+                if any(
+                    self.endpoint_origin(endpoint.base_url) == judge_origin
+                    for endpoint in self.endpoint_configs.values()
+                ):
+                    raise ValueError(
+                        "verifier base_url matching a named endpoint requires "
+                        "execution.adapter 'server60' and model.endpoint"
+                    )
+            return JudgeExecutionConfig()
+        if model.endpoint is None:
+            raise ValueError(
+                "verifier.execution.adapter 'server60' requires model.endpoint"
+            )
+        endpoint = self.endpoint_configs[model.endpoint]
+        if endpoint.policy.max_concurrency > 4:
+            raise ValueError(
+                "server60 endpoint max_concurrency cannot exceed 4"
+            )
+        endpoint_origin = self.endpoint_origin(endpoint.base_url)
+        for candidate in self.models:
+            candidate_url = self.model_base_url(candidate)
+            if candidate_url is None:
+                candidate_url = self.provider_environment_base_url(candidate)
+            if (
+                candidate_url
+                and self.endpoint_origin(candidate_url) == endpoint_origin
+                and candidate.get("endpoint") != model.endpoint
+            ):
+                raise ValueError(
+                    "Candidates sharing the server60 judge origin must use "
+                    f"endpoint '{model.endpoint}'"
+                )
+        comparison_cap = int(raw.get("comparison_max_output_tokens", 16384))
+        max_concurrency = int(raw.get("max_concurrency", 4))
+        if comparison_cap < 2:
+            raise ValueError("server60 comparison_max_output_tokens must be at least 2")
+        if max_concurrency < 1 or max_concurrency > 4:
+            raise ValueError("server60 judge max_concurrency must be between 1 and 4")
+        if max_concurrency > endpoint.policy.max_concurrency:
+            raise ValueError(
+                "server60 judge max_concurrency cannot exceed endpoint capacity"
+            )
+        return JudgeExecutionConfig(
+            adapter=adapter,
+            comparison_max_output_tokens=comparison_cap,
+            max_concurrency=max_concurrency,
         )
 
     def _majority_config(self, raw: dict) -> MajorityConfig:

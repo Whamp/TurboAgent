@@ -28,6 +28,15 @@ Selection of one candidate as the response. That includes the majority-vote shor
 **Judge**:
 The LLM that scores directed pairs during the pivot tournament.
 
+**Endpoint**:
+A named outbound model server with one base URL and one shared capacity policy. Backend models and the Judge reference the same Endpoint name when they compete for the same server.
+
+**Endpoint admission**:
+The bounded FIFO scheduler for one Endpoint. It owns active-call capacity, queue size, queue deadlines, request deadlines, cancellation, and slot release across Candidate and Judge calls.
+
+**server60 Judge adapter**:
+The opt-in Judge client that runs comparison generations with x-high thinking and disables thinking for llm-verifier's one-token score probes. It does not change Candidate generation.
+
 **Majority voting**:
 A verification shortcut: if more than half the candidates agree, the tournament does not run and that completion wins. Agreement modes: `exact` (raw string equality), `normalized` (case/punctuation/whitespace-insensitive), or `semantic` — tool calls must still match exactly; prose may agree via embedding cosine similarity. Semantic agreement is a speed/risk tradeoff, not proof of equivalence.
 

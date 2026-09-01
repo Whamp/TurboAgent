@@ -98,6 +98,24 @@ async def test_base_url_reaches_complete_call():
 
     assert fake.calls[0]["base_url"] == "http://127.0.0.1:9999/v1"
     assert fake.calls[0]["api_key"] == "dummy-key"
+    assert "max_retries" not in fake.calls[0]
+    assert "timeout" not in fake.calls[0]
+
+
+async def test_endpoint_retry_and_timeout_policy_reaches_candidate_call():
+    executor, target = make_target(
+        {"max_retries": 0, "request_timeout_seconds": 1800.0}
+    )
+    fake = FakeCompletion()
+    executor._complete_fn = fake
+
+    await executor.complete(
+        target,
+        ModelExecutionRequest(messages=({"role": "user", "content": "hi"},)),
+    )
+
+    assert fake.calls[0]["max_retries"] == 0
+    assert fake.calls[0]["timeout"] == 1800.0
 
 
 async def test_base_url_reaches_stream_call():
@@ -318,6 +336,45 @@ async def test_rate_limit_normalizes_retryable():
 # ---------------------------------------------------------------------------
 # Cancellation
 # ---------------------------------------------------------------------------
+
+
+async def test_stream_close_closes_underlying_provider_stream():
+    executor, target = make_target()
+
+    class ProviderStream:
+        def __init__(self) -> None:
+            self.emitted = False
+            self.closed = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self.emitted:
+                await asyncio.sleep(60)
+            self.emitted = True
+            return _stream_chunk(content_delta="started")
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    provider_stream = ProviderStream()
+
+    async def fake_stream(**_kwargs):
+        return provider_stream
+
+    executor._complete_fn = fake_stream
+    stream = executor.stream(
+        target,
+        ModelExecutionRequest(messages=({"role": "user", "content": "hi"},)),
+    )
+
+    event = await anext(stream)
+    assert event == TextDelta("started")
+
+    await stream.aclose()
+
+    assert provider_stream.closed is True
 
 
 async def test_cancel_propagates_and_cancels_underlying_call():

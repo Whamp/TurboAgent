@@ -10,6 +10,7 @@ import asyncio
 import copy
 import json
 from collections.abc import AsyncIterator
+from contextlib import aclosing
 from typing import Any
 
 import litellm
@@ -245,6 +246,10 @@ class LiteLLMExecutor(ModelExecutor):
             params["api_key"] = spec.api_key
         if spec.base_url:
             params["base_url"] = spec.base_url
+        if spec.max_retries is not None:
+            params["max_retries"] = spec.max_retries
+        if spec.request_timeout_seconds is not None:
+            params["timeout"] = spec.request_timeout_seconds
 
         max_tokens = _effective_max_tokens(spec, generation)
         if max_tokens is not None:
@@ -378,9 +383,12 @@ class LiteLLMExecutor(ModelExecutor):
             raise _wrap_error(target, exc) from exc
 
         accumulator = _StreamAccumulator(target)
-        async for chunk in response:
-            chunk_dict = chunk.model_dump() if hasattr(chunk, "model_dump") else chunk
-            for event in accumulator.ingest(chunk_dict):
-                yield event
+        async with aclosing(response):
+            async for chunk in response:
+                chunk_dict = (
+                    chunk.model_dump() if hasattr(chunk, "model_dump") else chunk
+                )
+                for event in accumulator.ingest(chunk_dict):
+                    yield event
 
         yield ExecutionCompleted(result=accumulator.build_result())

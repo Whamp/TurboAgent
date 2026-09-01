@@ -1,5 +1,6 @@
 import json
 import time
+from contextlib import aclosing
 
 import httpx
 from fastapi import FastAPI, Request
@@ -219,8 +220,10 @@ class ProxyServer:
     ) -> Response:
         async def generate():
             try:
-                async for event in self._backend.stream_anthropic(body):
-                    yield event
+                stream = self._backend.stream_anthropic(body)
+                async with aclosing(stream):
+                    async for event in stream:
+                        yield event
             except Exception as e:
                 logger.error(f"BACKEND STREAM ERROR {e}")
                 yield SSEFormatter.error(str(e))
@@ -293,8 +296,10 @@ class ProxyServer:
     ) -> Response:
         async def generate():
             try:
-                async for event in self._backend.stream_openai(body):
-                    yield event
+                stream = self._backend.stream_openai(body)
+                async with aclosing(stream):
+                    async for event in stream:
+                        yield event
             except Exception as e:
                 logger.error(f"BACKEND STREAM ERROR {e}")
                 yield f"data: {json.dumps({'error': {'message': str(e), 'type': 'server_error'}})}\n\n"

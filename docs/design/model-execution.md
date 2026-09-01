@@ -8,6 +8,8 @@ A caller names a configured Backend model, supplies one prepared Candidate reque
 
 This design fixes the current gap where a Backend model's `base_url` is loaded from YAML but never reaches `llm_completion` or `llm_stream_completion`. It also gives Turbo Agent a path to Pi's `openai-codex-responses` implementation and subscription credentials without copying OAuth behavior into Python.
 
+[ADR-0002](../adr/0002-endpoint-admission-and-server60-judge.md) later added one admission decorator around this interface. Candidate and Judge calls can now share named endpoint capacity without adding scheduling fields to `ModelExecutionRequest`. See [Endpoint admission and server60 judging](endpoint-admission.md).
+
 ## Seam and ownership
 
 The seam sits between Concurrent inference and outbound model calls.
@@ -15,7 +17,7 @@ The seam sits between Concurrent inference and outbound model calls.
 | Concern | Owner |
 | --- | --- |
 | Number of Candidates | Concurrent inference |
-| Candidate start order and future capacity limits | Concurrent inference |
+| Endpoint admission order, queue bounds, and deadlines | Endpoint admission |
 | Context refinement | Request pipeline |
 | Configured target, endpoint, credentials, wire model id | Model execution |
 | Model defaults and client-intent precedence | Model execution |

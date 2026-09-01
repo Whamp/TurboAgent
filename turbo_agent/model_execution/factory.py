@@ -3,7 +3,9 @@
 import os
 from dataclasses import dataclass
 
+from ..endpoint_admission import EndpointAdmissionRegistry
 from ..utils import Config
+from .admission_executor import EndpointAdmissionExecutor
 from .litellm_adapter import LiteLLMExecutor
 from .pi_adapter import PiCompanionExecutor
 from .types import (
@@ -21,9 +23,6 @@ class RoutingExecutor(ModelExecutor):
 
     def __init__(self, routes: dict[ModelTarget, ModelExecutor]) -> None:
         self._routes = dict(routes)
-
-    def resolve(self, target: ModelTarget):
-        return self._routes[target].resolve(target)
 
     async def complete(
         self,
@@ -64,6 +63,7 @@ def build_candidate_execution(
     config: Config,
     executor: ModelExecutor | None = None,
     pi_executor: ModelExecutor | None = None,
+    admission_registry: EndpointAdmissionRegistry | None = None,
 ) -> ExecutionTargets:
     """Build the Candidate execution plan from backend.models config.
 
@@ -72,17 +72,33 @@ def build_candidate_execution(
     credentials and endpoints stay inside the executor.
     """
     specs: dict[ModelTarget, TargetSpec] = {}
+    target_endpoints: dict[ModelTarget, str] = {}
     candidate_targets: list[ModelTarget] = []
     for index, model in enumerate(config.models):
         target = ModelTarget(id=f"backend-{index}", name=model["name"])
+        endpoint_name = model.get("endpoint") or None
+        if endpoint_name and model.get("executor") == "pi":
+            raise ValueError("Pi executor targets cannot use endpoint admission")
+        base_url = config.model_base_url(model)
+        endpoint_config = (
+            config.endpoint_configs[endpoint_name] if endpoint_name else None
+        )
         specs[target] = TargetSpec(
             name=model["name"],
             api_key=model.get("api_key") or None,
-            base_url=model.get("base_url") or None,
+            base_url=base_url,
             temperature=model.get("temperature"),
             max_output_tokens=model.get("max_tokens"),
+            max_retries=0 if endpoint_config else None,
+            request_timeout_seconds=(
+                endpoint_config.policy.request_timeout_seconds
+                if endpoint_config
+                else None
+            ),
             thinking=_thinking_from_config(model.get("thinking")),
         )
+        if endpoint_name:
+            target_endpoints[target] = endpoint_name
         candidate_targets.extend([target] * model.get("num_candidates", 1))
 
     if not candidate_targets:
@@ -92,6 +108,19 @@ def build_candidate_execution(
     if executor is None:
         executor = _compose_executors(config, specs, pi_executor)
         _apply_legacy_gemini_env(config)
+    if target_endpoints:
+        if admission_registry is None:
+            admission_registry = EndpointAdmissionRegistry(
+                {
+                    name: endpoint.policy
+                    for name, endpoint in config.endpoint_configs.items()
+                }
+            )
+        executor = EndpointAdmissionExecutor(
+            executor,
+            admission_registry,
+            target_endpoints,
+        )
     return ExecutionTargets(
         executor=executor,
         candidate_targets=tuple(candidate_targets),

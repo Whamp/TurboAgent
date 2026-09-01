@@ -28,7 +28,9 @@ from llm_verifier.fine_grained_reward import (
 )
 from llm_verifier.prompts import normalize_criteria
 
+from ..endpoint_admission import EndpointAdmissionRegistry
 from ..utils import VerifierConfig, create_logger
+from .server60_judge_adapter import Server60JudgeClient
 
 _logger = create_logger("verifier")
 
@@ -106,8 +108,17 @@ class Verifier:
     # (keyless gemini/*). _UNSET means the client has not been resolved yet.
     _UNSET = object()
 
-    def __init__(self, cfg: VerifierConfig):
+    def __init__(
+        self,
+        cfg: VerifierConfig,
+        admission_registry: EndpointAdmissionRegistry | None = None,
+    ):
         self.cfg = cfg
+        self._admission_registry = admission_registry
+        if cfg.execution.adapter == "server60" and admission_registry is None:
+            raise ValueError(
+                "server60 verifier execution requires endpoint admission"
+            )
         self.method = cfg.method
         self.model_id = self._wire_model_id(cfg.model.name)
         self.criteria = normalize_criteria(
@@ -153,7 +164,13 @@ class Verifier:
         api_key = self.cfg.model.api_key
         base_url = self.cfg.model.base_url
 
-        if name.startswith("gemini/"):
+        if self.cfg.execution.adapter == "server60":
+            self._client = create_openai_client(
+                base_url=base_url,
+                api_key=api_key,
+            )
+            self._client.max_retries = 0
+        elif name.startswith("gemini/"):
             if api_key:
                 from google import genai
                 if self.cfg.model.provider == "vertex_ai":
@@ -180,6 +197,21 @@ class Verifier:
                 )
             self._client = create_openai_client(base_url=base_url,
                                                 api_key=api_key)
+        if self.cfg.execution.adapter == "server60":
+            registry = self._admission_registry
+            endpoint_name = self.cfg.model.endpoint
+            if registry is None or endpoint_name is None:
+                raise RuntimeError(
+                    "server60 verifier execution lost endpoint admission"
+                )
+            self._client = Server60JudgeClient(
+                self._client,
+                registry,
+                endpoint_name=endpoint_name,
+                comparison_max_output_tokens=(
+                    self.cfg.execution.comparison_max_output_tokens
+                ),
+            )
         return self._client
 
     # ------------------------------------------------------------------
@@ -249,6 +281,12 @@ class Verifier:
                 seed=m.seed,
                 model=self.model_id,
                 client=self.client,
+                max_workers=self.cfg.execution.max_concurrency,
+                on_error=(
+                    "raise"
+                    if self.cfg.execution.adapter == "server60"
+                    else "tie"
+                ),
                 cache=cache,
                 progress=False,
             )

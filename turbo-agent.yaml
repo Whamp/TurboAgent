@@ -13,7 +13,8 @@ backend:
 # OpenAI-compatible endpoint exposing token logprobs (Gemini via Vertex,
 # DeepSeek, OpenRouter, or any local vLLM/SGLang/llama.cpp server).
 # Majority voting skips the tournament when a strict majority of candidates
-# agree:
+# agree. For shared local-server capacity and the server60 judge adapter,
+# use a named endpoint as shown in docs/design/endpoint-admission.md.
 #
 #   majority.mode: exact      raw string equality (default)
 #   majority.mode: normalized case/punctuation/whitespace-insensitive
@@ -29,7 +30,12 @@ backend:
 #   model:
 #     name: openai/<judge-model>
 #     api_key: $OPENAI_API_KEY
-#     # base_url: http://127.0.0.1:8097/v1   # for a local judge
+#     # base_url: http://127.0.0.1:8097/v1   # local judge without admission
+#     # endpoint: server60                    # named endpoint with admission
+#   # execution:                             # server60 reasoning/logprob adapter
+#   #   adapter: server60
+#   #   comparison_max_output_tokens: 16384
+#   #   max_concurrency: 4
 #   majority_voting: true
 #   majority:
 #     mode: semantic
